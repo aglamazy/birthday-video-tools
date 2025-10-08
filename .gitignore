@@ -1,0 +1,7 @@
+.idea/
+.venv/
+__pycache__/
+data (Copy)/
+data/
+sequence/
+slideshow.mp4
