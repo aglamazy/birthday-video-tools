@@ -4,13 +4,32 @@
 from __future__ import annotations
 
 import argparse
+import json
 import re
 import shutil
 import subprocess
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable, List, Optional, Tuple
+from typing import Iterable, List, Optional, Sequence, Tuple
+
+from text_utils import TextLayout, combine_overlay_texts, load_text_layout
+
+DEFAULT_CONFIG = {
+    "source_dir": "sequence",
+    "output": "slideshow.mp4",
+    "duration_image": 2.0,
+    "duration_overlay": 6.0,
+    "duration_text": 6.0,
+    "fps": 30,
+    "resolution": "1920x1080",
+    "chunk_size": None,
+    "chunk_index": 1,
+    "debug_filename": False,
+    "audio_files": [],
+}
+
+CONFIG_PATH = Path(__file__).resolve().parent / "config.json"
 
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".heic", ".heif"}
 VIDEO_EXTENSIONS = {".mp4", ".mov", ".m4v", ".avi", ".mkv", ".hevc", ".mpg", ".mpeg", ".wmv"}
@@ -19,6 +38,130 @@ TEXT_EXTENSIONS = {".txt", ".pug"}
 VERBOSE = False
 LABEL_YEAR = False
 FONT_PATH: Optional[Path] = None
+SHOW_FILENAME = False
+
+
+def load_config(path: Path) -> dict[str, object]:
+    config = DEFAULT_CONFIG.copy()
+    if not path.exists():
+        return config
+    try:
+        raw = path.read_text(encoding="utf-8")
+        data = json.loads(raw)
+    except (OSError, json.JSONDecodeError) as exc:
+        print(f"Warning: failed to read config {path}: {exc}")
+        return config
+    if not isinstance(data, dict):
+        print(f"Warning: config {path} is not a JSON object; using defaults")
+        return config
+    for key in config:
+        if key in data:
+            config[key] = data[key]
+    return config
+
+
+def _config_float(config: dict[str, object], key: str, fallback: float) -> float:
+    try:
+        value = config.get(key, fallback)
+        return float(value)
+    except (TypeError, ValueError):
+        return fallback
+
+
+def _config_str(config: dict[str, object], key: str, fallback: str) -> str:
+    value = config.get(key, fallback)
+    if isinstance(value, str) and value:
+        return value
+    return fallback
+
+
+def _config_int(config: dict[str, object], key: str, fallback: int) -> int:
+    try:
+        value = config.get(key, fallback)
+        return int(value)
+    except (TypeError, ValueError):
+        return fallback
+
+
+def _config_optional_positive_int(
+    config: dict[str, object], key: str, fallback: Optional[int]
+) -> Optional[int]:
+    value = config.get(key, fallback)
+    if value is None:
+        return None
+    try:
+        number = int(value)
+    except (TypeError, ValueError):
+        return fallback
+    if number <= 0:
+        return fallback
+    return number
+
+
+def _config_bool(config: dict[str, object], key: str, fallback: bool) -> bool:
+    value = config.get(key, fallback)
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"1", "true", "yes", "on"}:
+            return True
+        if normalized in {"0", "false", "no", "off"}:
+            return False
+    return fallback
+
+
+def _config_list(config: dict[str, object], key: str) -> list[str]:
+    value = config.get(key, [])
+    if not isinstance(value, list):
+        return []
+    result: list[str] = []
+    for item in value:
+        if isinstance(item, str) and item.strip():
+            result.append(item.strip())
+    return result
+
+
+def resolve_media_path(path: Path) -> Optional[Path]:
+    candidates: list[Path] = []
+    if path.is_absolute():
+        candidates.append(path)
+    else:
+        candidates.append((CONFIG_PATH.parent / path).resolve())
+        candidates.append((Path.cwd() / path).resolve())
+    seen: set[Path] = set()
+    for candidate in candidates:
+        if candidate in seen:
+            continue
+        seen.add(candidate)
+        try:
+            if candidate.exists():
+                return candidate
+        except OSError:
+            continue
+    return None
+
+
+def resolve_audio_files(paths: Iterable[Path]) -> tuple[list[Path], list[Path]]:
+    resolved: list[Path] = []
+    missing: list[Path] = []
+    seen: set[Path] = set()
+    for raw in paths:
+        candidate = resolve_media_path(raw)
+        if candidate is None:
+            missing.append(raw)
+            continue
+        if candidate in seen:
+            continue
+        seen.add(candidate)
+        resolved.append(candidate)
+    return resolved, missing
+
+
+def build_batch_output_path(base: Path, chunk_index: int) -> Path:
+    suffix = base.suffix if base.suffix else ".mp4"
+    stem = base.stem if base.suffix else base.name
+    return base.with_name(f"{stem}-{chunk_index}{suffix}")
 
 
 @dataclass(frozen=True)
@@ -27,44 +170,105 @@ class Segment:
     output: Path
     kind: str  # "image", "video", or "text"
     label: Optional[str] = None
-    text: Optional[str] = None
+    text_layout: Optional[TextLayout] = None
+    overlay_text: Optional[str] = None
+    overlay_sources: tuple[Path, ...] = ()
+    duration: Optional[float] = None
 
 
 class FFMpegError(RuntimeError):
     pass
 
 
-def parse_args() -> argparse.Namespace:
+def parse_args(config: dict[str, object]) -> argparse.Namespace:
+    default_source = _config_str(config, "source_dir", DEFAULT_CONFIG["source_dir"])
+    default_output = _config_str(config, "output", DEFAULT_CONFIG["output"])
+    default_duration_image = _config_float(
+        config, "duration_image", DEFAULT_CONFIG["duration_image"]
+    )
+    default_duration_overlay = _config_float(
+        config, "duration_overlay", DEFAULT_CONFIG["duration_overlay"]
+    )
+    default_duration_text = _config_float(
+        config, "duration_text", DEFAULT_CONFIG["duration_text"]
+    )
+    default_fps = _config_int(config, "fps", DEFAULT_CONFIG["fps"])
+    default_resolution = _config_str(
+        config, "resolution", DEFAULT_CONFIG["resolution"]
+    )
+    default_chunk_size = _config_optional_positive_int(
+        config, "chunk_size", DEFAULT_CONFIG["chunk_size"]
+    )
+    default_chunk_index = _config_int(
+        config, "chunk_index", DEFAULT_CONFIG["chunk_index"]
+    )
+    default_debug_filename = _config_bool(
+        config, "debug_filename", DEFAULT_CONFIG["debug_filename"]
+    )
+    config_audio_list = _config_list(config, "audio_files")
+    audio_default_desc = (
+        ", ".join(config_audio_list) if config_audio_list else "none"
+    )
+
+    chunk_size_default_desc = (
+        str(default_chunk_size) if default_chunk_size is not None else "disabled"
+    )
+
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--source-dir",
         type=Path,
-        default=Path("sequence"),
-        help="Folder containing the ordered media files (default: sequence).",
+        default=Path(default_source),
+        help=f"Folder containing the ordered media files (default: {default_source}).",
     )
     parser.add_argument(
         "--output",
         type=Path,
-        default=Path("slideshow.mp4"),
-        help="Output MP4 filename (default: slideshow.mp4).",
+        default=Path(default_output),
+        help=f"Output MP4 filename (default: {default_output}).",
     )
     parser.add_argument(
         "--duration",
+        "--duration-image",
+        dest="duration_image",
         type=float,
-        default=2.0,
-        help="Duration in seconds for each still image (default: 2.0).",
+        default=default_duration_image,
+        help=(
+            "Duration in seconds for each still image without overlays "
+            f"(default: {default_duration_image})."
+        ),
+    )
+    parser.add_argument(
+        "--duration-overlay",
+        dest="duration_overlay",
+        type=float,
+        default=default_duration_overlay,
+        help=(
+            "Duration in seconds for images that include overlay text "
+            f"(default: {default_duration_overlay})."
+        ),
+    )
+    parser.add_argument(
+        "--duration-text",
+        dest="duration_text",
+        type=float,
+        default=default_duration_text,
+        help=(
+            "Duration in seconds for full-screen text slides "
+            f"(default: {default_duration_text})."
+        ),
     )
     parser.add_argument(
         "--fps",
         type=int,
-        default=30,
-        help="Frame rate for the generated video (default: 30).",
+        default=default_fps,
+        help=f"Frame rate for the generated video (default: {default_fps}).",
     )
     parser.add_argument(
         "--resolution",
         type=str,
-        default="1920x1080",
-        help="Target resolution WIDTHxHEIGHT (default: 1920x1080).",
+        default=default_resolution,
+        help=f"Target resolution WIDTHxHEIGHT (default: {default_resolution}).",
     )
     parser.add_argument(
         "--keep-temp",
@@ -75,6 +279,58 @@ def parse_args() -> argparse.Namespace:
         "--limit",
         type=int,
         help="Only process the first N media files (useful for quick tests).",
+    )
+    parser.add_argument(
+        "--chunk-size",
+        type=int,
+        default=default_chunk_size,
+        help=(
+            "Number of files per chunk for paginated preview runs "
+            f"(default: {chunk_size_default_desc})."
+        ),
+    )
+    parser.add_argument(
+        "--chunk-index",
+        type=int,
+        default=default_chunk_index,
+        help=(
+            "Chunk number to process when --chunk-size is set "
+            f"(1-based, default: {default_chunk_index})."
+        ),
+    )
+    parser.add_argument(
+        "--audio-file",
+        dest="audio_files",
+        action="append",
+        type=Path,
+        help=(
+            "Audio file to append to the soundtrack (repeatable). "
+            f"Default sources: {audio_default_desc}."
+        ),
+    )
+    parser.add_argument(
+        "--batch",
+        action="store_true",
+        help=(
+            "Render every chunk sequentially using --chunk-size and write numbered "
+            "output files (e.g., slideshow-1.mp4)."
+        ),
+    )
+    parser.add_argument(
+        "--debug-filename",
+        dest="debug_filename",
+        action="store_true",
+        default=default_debug_filename,
+        help=(
+            "Overlay each segment's source filename for debugging "
+            f"(default: {'on' if default_debug_filename else 'off'})."
+        ),
+    )
+    parser.add_argument(
+        "--no-debug-filename",
+        dest="debug_filename",
+        action="store_false",
+        help=argparse.SUPPRESS,
     )
     parser.add_argument(
         "--verbose",
@@ -95,11 +351,13 @@ def parse_args() -> argparse.Namespace:
 
 
 def main() -> None:
-    args = parse_args()
+    config = load_config(CONFIG_PATH)
+    args = parse_args(config)
     global VERBOSE
     VERBOSE = args.verbose
-    global LABEL_YEAR, FONT_PATH
+    global LABEL_YEAR, FONT_PATH, SHOW_FILENAME
     LABEL_YEAR = args.label_year
+    SHOW_FILENAME = args.debug_filename
     if args.label_font and args.label_font.exists():
         FONT_PATH = args.label_font
     else:
@@ -113,6 +371,19 @@ def main() -> None:
         )
         LABEL_YEAR = False
 
+    config_audio_entries = _config_list(config, "audio_files")
+    config_audio_paths = [Path(entry) for entry in config_audio_entries]
+    cli_audio_paths = args.audio_files or []
+    audio_candidates: list[Path] = []
+    if cli_audio_paths:
+        audio_candidates.extend(cli_audio_paths)
+    else:
+        audio_candidates.extend(config_audio_paths)
+
+    resolved_audio_paths, missing_audio_paths = resolve_audio_files(audio_candidates)
+    for missing_audio in missing_audio_paths:
+        print(f"Warning: audio file {missing_audio} not found; skipping.")
+
     ffmpeg_path = shutil.which("ffmpeg")
     if not ffmpeg_path:
         raise SystemExit("ffmpeg is required but not found in PATH.")
@@ -124,49 +395,169 @@ def main() -> None:
         raise SystemExit(f"Source directory {source_dir} does not exist or is not a directory")
 
     media_files = sorted(p for p in source_dir.iterdir() if p.is_file())
-    if args.limit:
-        media_files = media_files[: args.limit]
-    if not media_files:
+    total_media = len(media_files)
+
+    if total_media == 0:
         print("No media files found in source directory.")
         return
+
+    if args.batch and args.limit:
+        print("Warning: --limit is ignored when --batch is used.")
+
+    if args.batch:
+        if args.chunk_size is None:
+            raise SystemExit("--batch requires --chunk-size (set via config or CLI).")
+        if args.chunk_size <= 0:
+            raise SystemExit("--chunk-size must be a positive integer")
+        chunk_size = args.chunk_size
+        chunk_count = (total_media + chunk_size - 1) // chunk_size
+        if chunk_count == 0:
+            print("No media files found in source directory.")
+            return
+        for chunk_idx in range(1, chunk_count + 1):
+            start = (chunk_idx - 1) * chunk_size
+            end = start + chunk_size
+            chunk_media = media_files[start:end]
+            if not chunk_media:
+                continue
+            start_pos = start + 1
+            end_pos = start + len(chunk_media)
+            output_path = build_batch_output_path(args.output, chunk_idx)
+            print(
+                f"Chunk {chunk_idx}/{chunk_count} (items {start_pos}-{end_pos} of {total_media})"
+                f" -> {output_path.name}"
+            )
+            render_slideshow(
+                chunk_media,
+                args,
+                ffmpeg_path,
+                width,
+                height,
+                output_path,
+                audio_paths=resolved_audio_paths,
+            )
+        return
+
+    selected_media = media_files
+    if args.chunk_size is not None:
+        if args.chunk_size <= 0:
+            raise SystemExit("--chunk-size must be a positive integer")
+        if args.chunk_index <= 0:
+            raise SystemExit("--chunk-index must be a positive integer")
+        start = (args.chunk_index - 1) * args.chunk_size
+        end = start + args.chunk_size
+        selected_media = selected_media[start:end]
+        if selected_media:
+            start_pos = start + 1
+            end_pos = start + len(selected_media)
+            print(
+                f"Chunk {args.chunk_index} (items {start_pos}-{end_pos} of {total_media})"
+            )
+        else:
+            print(
+                f"No media files matched chunk {args.chunk_index} "
+                f"(chunk size {args.chunk_size}, total files {total_media})."
+            )
+            return
+
+    if args.limit:
+        selected_media = selected_media[: args.limit]
+
+    if not selected_media:
+        print("No media files found in source directory.")
+        return
+
+    render_slideshow(
+        selected_media,
+        args,
+        ffmpeg_path,
+        width,
+        height,
+        args.output,
+        audio_paths=resolved_audio_paths,
+    )
+
+
+def render_slideshow(
+    media_files: List[Path],
+    args: argparse.Namespace,
+    ffmpeg_path: str,
+    width: int,
+    height: int,
+    output_path: Path,
+    audio_paths: Optional[Sequence[Path]] = None,
+) -> None:
+    media_files = list(media_files)
+    if args.limit and not args.batch:
+        media_files = media_files[: args.limit]
+
+    resolved_audio_paths = list(audio_paths or [])
+
+    media_stems_with_visual = {
+        path.stem
+        for path in media_files
+        if path.suffix.lower() in IMAGE_EXTENSIONS or path.suffix.lower() in VIDEO_EXTENSIONS
+    }
+
+    # Pair auxiliary text files with matching media for overlays.
+    overlay_text_map: dict[str, list[Path]] = {}
+    # Track texts already consumed as overlays so they are not treated as slides.
+    overlay_text_paths: set[Path] = set()
+    for path in media_files:
+        suffix = path.suffix.lower()
+        if suffix in TEXT_EXTENSIONS and path.stem in media_stems_with_visual:
+            overlay_text_map.setdefault(path.stem, []).append(path)
+            overlay_text_paths.add(path)
 
     segments: List[Segment] = []
     tmp_dir_ctx = tempfile.TemporaryDirectory() if not args.keep_temp else None
     if tmp_dir_ctx is not None:
         temp_dir_path = Path(tmp_dir_ctx.name)
     else:
-        temp_dir_path = args.output.parent / ".segments"
+        temp_dir_path = output_path.parent / ".segments"
         temp_dir_path.mkdir(parents=True, exist_ok=True)
 
-    for idx, media in enumerate(media_files, start=1):
+    segment_index = 0
+    for media in media_files:
         suffix = media.suffix.lower()
-        segment_path = temp_dir_path / f"segment_{idx:04d}.mp4"
-        if suffix in IMAGE_EXTENSIONS:
-            segments.append(
-                Segment(
-                    source=media,
-                    output=segment_path,
-                    kind="image",
-                    label=infer_year_text(media),
+        if suffix in IMAGE_EXTENSIONS or suffix in VIDEO_EXTENSIONS:
+            segment_index += 1
+            segment_path = temp_dir_path / f"segment_{segment_index:04d}.mp4"
+            overlay_sources = overlay_text_map.get(media.stem, [])
+            overlay_text_value: Optional[str] = None
+            if overlay_sources:
+                combined = combine_overlay_texts(overlay_sources)
+                if combined:
+                    overlay_text_value = combined
+            duration_value: Optional[float] = None
+            if suffix in IMAGE_EXTENSIONS:
+                duration_value = (
+                    args.duration_overlay if overlay_text_value else args.duration_image
                 )
-            )
-        elif suffix in VIDEO_EXTENSIONS:
             segments.append(
                 Segment(
                     source=media,
                     output=segment_path,
-                    kind="video",
+                    kind="image" if suffix in IMAGE_EXTENSIONS else "video",
                     label=infer_year_text(media),
+                    overlay_text=overlay_text_value,
+                    overlay_sources=tuple(overlay_sources),
+                    duration=duration_value,
                 )
             )
         elif suffix in TEXT_EXTENSIONS:
-            text = parse_text_slide(media)
+            if media in overlay_text_paths:
+                continue
+            segment_index += 1
+            segment_path = temp_dir_path / f"segment_{segment_index:04d}.mp4"
+            text_layout = load_text_layout(media)
             segments.append(
                 Segment(
                     source=media,
                     output=segment_path,
                     kind="text",
-                    text=text,
+                    text_layout=text_layout,
+                    duration=args.duration_text,
                 )
             )
         else:
@@ -174,6 +565,8 @@ def main() -> None:
 
     if not segments:
         print("No convertible media files found.")
+        if tmp_dir_ctx:
+            tmp_dir_ctx.cleanup()
         return
 
     concat_entries: List[str] = []
@@ -190,18 +583,36 @@ def main() -> None:
             extra: List[str] = []
             if label:
                 extra.append(f"label {label}")
-            if segment.kind == "text" and segment.text:
-                non_empty = next((ln for ln in segment.text.splitlines() if ln.strip()), "")
-                if non_empty:
-                    suffix = "…" if len(non_empty) > 40 else ""
-                    extra.append(f"text '{non_empty[:40]}{suffix}'")
+            if segment.overlay_text:
+                overlay_names = (
+                    ", ".join(src.name for src in segment.overlay_sources)
+                    if segment.overlay_sources
+                    else "overlay text"
+                )
+                extra.append(f"overlay {overlay_names}")
+            if SHOW_FILENAME:
+                extra.append(f"filename {segment.source.name}")
+            if segment.kind == "text" and segment.text_layout:
+                preview = segment.text_layout.preview_text()
+                if preview:
+                    ellipsis = "…" if len(preview) > 40 else ""
+                    extra.append(f"text '{preview[:40]}{ellipsis}'")
                 else:
                     extra.append("text slide")
             print(
                 f"[{idx}/{total}] {segment.kind} {segment.source.name}"
                 f" -> {segment.output.name}" + (f" ({', '.join(extra)})" if extra else "")
             )
+            debug_text = segment.source.name if SHOW_FILENAME else None
             if segment.kind == "image":
+                still_duration = segment.duration or args.duration_image
+                filter_graph, filter_output = build_media_filter_graph(
+                    width,
+                    height,
+                    segment.overlay_text,
+                    label,
+                    debug_text,
+                )
                 run_ffmpeg(
                     [
                         ffmpeg_path,
@@ -214,18 +625,22 @@ def main() -> None:
                         "-framerate",
                         str(args.fps),
                         "-t",
-                        f"{args.duration}",
+                        f"{still_duration}",
                         "-i",
                         str(segment.source),
                         "-f",
                         "lavfi",
                         "-t",
-                        f"{args.duration}",
+                        f"{still_duration}",
                         "-i",
                         "anullsrc=channel_layout=stereo:sample_rate=48000",
                         "-shortest",
-                        "-vf",
-                        build_filter_chain(width, height, label),
+                        "-filter_complex",
+                        filter_graph,
+                        "-map",
+                        f"[{filter_output}]",
+                        "-map",
+                        "1:a:0",
                         "-c:v",
                         "libx264",
                         "-pix_fmt",
@@ -242,6 +657,13 @@ def main() -> None:
                     ]
                 )
             elif segment.kind == "video":
+                filter_graph, filter_output = build_media_filter_graph(
+                    width,
+                    height,
+                    segment.overlay_text,
+                    label,
+                    debug_text,
+                )
                 run_ffmpeg(
                     [
                         ffmpeg_path,
@@ -251,18 +673,18 @@ def main() -> None:
                         "-y",
                         "-i",
                         str(segment.source),
-                        "-vf",
-                        build_filter_chain(width, height, label),
+                        "-filter_complex",
+                        filter_graph,
+                        "-map",
+                        f"[{filter_output}]",
+                        "-map",
+                        "0:a?",
                         "-r",
                         str(args.fps),
                         "-c:v",
                         "libx264",
                         "-pix_fmt",
                         "yuv420p",
-                        "-map",
-                        "0:v:0",
-                        "-map",
-                        "0:a?",
                         "-c:a",
                         "aac",
                         "-b:a",
@@ -273,15 +695,19 @@ def main() -> None:
                     ]
                 )
             else:  # text
+                slide_duration = segment.duration or args.duration_text
+                if segment.text_layout is None:
+                    raise RuntimeError(f"Missing text layout for segment {segment.source}")
                 run_ffmpeg(
                     build_text_segment_cmd(
                         ffmpeg_path,
-                        segment.text or "",
+                        segment.text_layout,
                         segment.output,
-                        args.duration,
+                        slide_duration,
                         width,
                         height,
                         args.fps,
+                        debug_text,
                     )
                 )
 
@@ -300,10 +726,12 @@ def main() -> None:
                 str(concat_path),
                 "-c",
                 "copy",
-                str(args.output),
+                str(output_path),
             ]
         )
-        print(f"Created {args.output}")
+        print(f"Created {output_path}")
+        if resolved_audio_paths:
+            apply_audio_track(ffmpeg_path, output_path, resolved_audio_paths)
     finally:
         if tmp_dir_ctx:
             tmp_dir_ctx.cleanup()
@@ -321,21 +749,133 @@ def parse_resolution(value: str) -> Tuple[int, int]:
     return width, height
 
 
-def build_filter_chain(width: int, height: int, label: Optional[str]) -> str:
-    base = (
-        f"scale={width}:{height}:force_original_aspect_ratio=decrease,"
-        f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2,format=yuv420p"
-    )
-    if label:
-        text = escape_drawtext(label)
-        font_clause = ""
-        if FONT_PATH:
-            font_clause = f"fontfile='{escape_drawtext(FONT_PATH.as_posix())}':"
-        base += (
-            f",drawtext={font_clause}text='{text}':fontsize=48:fontcolor=white:"
-            f"box=1:boxcolor=0x00000088:x=w-tw-40:y=h-th-40"
+def build_media_filter_graph(
+    width: int,
+    height: int,
+    overlay_text: Optional[str],
+    label_text: Optional[str],
+    debug_text: Optional[str],
+) -> tuple[str, str]:
+    label_counter = 0
+
+    def next_label() -> str:
+        nonlocal label_counter
+        label_name = f"v{label_counter}"
+        label_counter += 1
+        return label_name
+
+    steps: list[str] = []
+    current = next_label()
+    base_filters = [
+        f"scale={width}:{height}:force_original_aspect_ratio=decrease",
+        f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2",
+        "format=yuv420p",
+    ]
+    steps.append(f"[0:v]{','.join(base_filters)}[{current}]")
+
+    def append_drawtext(filter_expr: str) -> None:
+        nonlocal current
+        next_out = next_label()
+        steps.append(f"[{current}]{filter_expr}[{next_out}]")
+        current = next_out
+
+    if overlay_text:
+        overlay_font_clause = (
+            f"fontfile='{escape_drawtext(FONT_PATH.as_posix())}':" if FONT_PATH else ""
         )
-    return base
+        overlay_value = escape_drawtext(overlay_text)
+        append_drawtext(
+            f"drawtext={overlay_font_clause}text='{overlay_value}':fontsize=52:"
+            "line_spacing=16:fontcolor=white:borderw=3:bordercolor=black:text_shaping=1:"
+            "x=(w-text_w)/2:y=(h-text_h)/2"
+        )
+
+    if label_text:
+        font_clause = (
+            f"fontfile='{escape_drawtext(FONT_PATH.as_posix())}':" if FONT_PATH else ""
+        )
+        label_value = escape_drawtext(label_text)
+        append_drawtext(
+            f"drawtext={font_clause}text='{label_value}':fontsize=48:fontcolor=white:"
+            "box=1:boxcolor=0x00000088:text_shaping=1:x=w-tw-40:y=h-th-40"
+        )
+
+    if debug_text:
+        debug_font_clause = (
+            f"fontfile='{escape_drawtext(FONT_PATH.as_posix())}':" if FONT_PATH else ""
+        )
+        debug_value = escape_drawtext(debug_text)
+        append_drawtext(
+            f"drawtext={debug_font_clause}text='{debug_value}':fontsize=32:"
+            "fontcolor=white:borderw=2:bordercolor=black:text_shaping=1:"
+            "x=40:y=40"
+        )
+
+    filter_graph = ";".join(steps)
+    return filter_graph, current
+
+
+def build_text_filter_graph(
+    width: int,
+    height: int,
+    layout: TextLayout,
+    debug_text: Optional[str],
+) -> tuple[str, str]:
+    label_counter = 0
+
+    def next_label() -> str:
+        nonlocal label_counter
+        label_name = f"t{label_counter}"
+        label_counter += 1
+        return label_name
+
+    steps: list[str] = []
+    current = next_label()
+    steps.append(f"[0:v]format=yuv420p[{current}]")
+
+    font_clause = (
+        f"fontfile='{escape_drawtext(FONT_PATH.as_posix())}':" if FONT_PATH else ""
+    )
+
+    if layout.title:
+        title_value = escape_drawtext(layout.title)
+        title_label = next_label()
+        steps.append(
+            f"[{current}]drawtext={font_clause}text='{title_value}':fontsize=72:"
+            "fontcolor=white:borderw=3:bordercolor=black:text_shaping=1:"
+            "x=(w-text_w)/2:y=140"
+            f"[{title_label}]"
+        )
+        current = title_label
+
+    if any(line.strip() for line in layout.body_lines):
+        body_value = escape_drawtext("\n".join(layout.body_lines))
+        body_label = next_label()
+        x_expr = "120" if layout.direction == "ltr" else "w-text_w-120"
+        y_expr = "260" if layout.title else "(h-text_h)/2"
+        steps.append(
+            f"[{current}]drawtext={font_clause}text='{body_value}':fontsize=56:"
+            "line_spacing=22:fontcolor=white:box=1:boxcolor=0x00000088:text_shaping=1:"
+            f"x={x_expr}:y={y_expr}"
+            f"[{body_label}]"
+        )
+        current = body_label
+
+    if debug_text:
+        debug_font_clause = (
+            f"fontfile='{escape_drawtext(FONT_PATH.as_posix())}':" if FONT_PATH else ""
+        )
+        debug_value = escape_drawtext(debug_text)
+        debug_label = next_label()
+        steps.append(
+            f"[{current}]drawtext={debug_font_clause}text='{debug_value}':fontsize=32:"
+            "fontcolor=white:borderw=2:bordercolor=black:text_shaping=1:x=40:y=40"
+            f"[{debug_label}]"
+        )
+        current = debug_label
+
+    filter_graph = ";".join(steps)
+    return filter_graph, current
 
 
 def run_ffmpeg(cmd: Iterable[str]) -> None:
@@ -350,6 +890,100 @@ def run_ffmpeg(cmd: Iterable[str]) -> None:
         print(result.stdout.strip())
 
 
+def apply_audio_track(
+    ffmpeg_path: str,
+    video_path: Path,
+    audio_paths: Sequence[Path],
+) -> None:
+    if not audio_paths:
+        return
+
+    existing_sources = [path for path in audio_paths if path.exists()]
+    if not existing_sources:
+        return
+
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        tmp_dir_path = Path(tmp_dir)
+        combined_audio = tmp_dir_path / "combined_audio.m4a"
+
+        if len(existing_sources) == 1:
+            run_ffmpeg(
+                [
+                    ffmpeg_path,
+                    "-hide_banner",
+                    "-loglevel",
+                    "error",
+                    "-y",
+                    "-i",
+                    str(existing_sources[0]),
+                    "-c:a",
+                    "aac",
+                    "-ac",
+                    "2",
+                    "-ar",
+                    "48000",
+                    str(combined_audio),
+                ]
+            )
+        else:
+            concat_cmd: List[str] = [
+                ffmpeg_path,
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-y",
+            ]
+            for source in existing_sources:
+                concat_cmd.extend(["-i", str(source)])
+            filter_inputs = "".join(f"[{idx}:a]" for idx in range(len(existing_sources)))
+            filter_complex = (
+                f"{filter_inputs}concat=n={len(existing_sources)}:v=0:a=1[aout]"
+            )
+            concat_cmd.extend(
+                [
+                    "-filter_complex",
+                    filter_complex,
+                    "-map",
+                    "[aout]",
+                    "-c:a",
+                    "aac",
+                    "-ac",
+                    "2",
+                    "-ar",
+                    "48000",
+                    str(combined_audio),
+                ]
+            )
+            run_ffmpeg(concat_cmd)
+
+        tmp_video = tmp_dir_path / "with_audio.mp4"
+        run_ffmpeg(
+            [
+                ffmpeg_path,
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-y",
+                "-i",
+                str(video_path),
+                "-i",
+                str(combined_audio),
+                "-map",
+                "0:v:0",
+                "-map",
+                "1:a:0",
+                "-c:v",
+                "copy",
+                "-c:a",
+                "aac",
+                "-shortest",
+                str(tmp_video),
+            ]
+        )
+        shutil.move(str(tmp_video), str(video_path))
+    print(f"Attached audio from {len(existing_sources)} file(s).")
+
+
 def infer_year_text(source: Path) -> Optional[str]:
     match = re.search(r"(19|20)\d{2}", source.stem)
     if match:
@@ -361,48 +995,22 @@ def escape_drawtext(value: str) -> str:
     return value.replace("\\", r"\\").replace("'", r"\'")
 
 
-def parse_text_slide(path: Path) -> str:
-    try:
-        content = path.read_text(encoding="utf-8")
-    except UnicodeDecodeError:
-        content = path.read_text(encoding="utf-8", errors="replace")
-
-    lines = []
-    for raw in content.splitlines():
-        if not raw.strip():
-            lines.append("")
-            continue
-        stripped = raw.strip()
-        if stripped.startswith("#"):
-            lines.append(stripped.lstrip("# "))
-            continue
-        level = (len(raw) - len(raw.lstrip(" \t"))) // 2
-        bullet = "• " if stripped.startswith("-") else ""
-        text = stripped.lstrip("- ")
-        prefix = "  " * level + ("• " if level and not bullet else bullet)
-        lines.append(prefix + text)
-
-    return "\n".join(lines).strip() or path.stem
-
-
 def build_text_segment_cmd(
     ffmpeg_path: str,
-    text: str,
+    layout: TextLayout,
     output: Path,
     duration: float,
     width: int,
     height: int,
     fps: int,
+    debug_text: Optional[str] = None,
 ) -> List[str]:
     base_color = f"color=color=0x101010:size={width}x{height}"
-    font_clause = (
-        f"fontfile='{escape_drawtext(FONT_PATH.as_posix())}':" if FONT_PATH else ""
-    )
-    escaped_text = escape_drawtext(text)
-    vf = (
-        "format=yuv420p," +
-        f"drawtext={font_clause}text='{escaped_text}':fontsize=64:line_spacing=18:"
-        "fontcolor=white:box=1:boxcolor=0x00000088:x=(w-text_w)/2:y=(h-text_h)/2"
+    filter_graph, filter_output = build_text_filter_graph(
+        width,
+        height,
+        layout,
+        debug_text,
     )
 
     return [
@@ -424,8 +1032,12 @@ def build_text_segment_cmd(
         "-i",
         "anullsrc=channel_layout=stereo:sample_rate=48000",
         "-shortest",
-        "-vf",
-        vf,
+        "-filter_complex",
+        filter_graph,
+        "-map",
+        f"[{filter_output}]",
+        "-map",
+        "1:a:0",
         "-c:v",
         "libx264",
         "-pix_fmt",
