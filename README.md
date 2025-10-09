@@ -12,6 +12,7 @@ Utilities for organising a raw photo dump into dated folders, generating a chron
 - `sequence_to_video.py` – renders the slideshow MP4 (and optional timeline audio)
 - `extract_audio.py` – trims audio out of a video file into an MP3 snippet
 - `lib/` – shared helpers used by the renderer (`text_utils.py`, `text_renderer.py`, `subtitle_renderer.py`)
+- `find_duplicates.py` – detects duplicate or visually similar photos
 
 ## Environment Setup
 
@@ -150,6 +151,14 @@ python sequence_to_video.py [--source-dir sequence]
 - Audio cues: add `NNN.mp3` alongside `NNN.jpg` (or `.mp4`). Each cue plays until the next cue and crossfades over the transition.
 - Global mixes: pass `--audio-file background.mp3` to append a traditional soundtrack instead of per-slide cues.
 - Use `--chunk-size 120 --batch` to render every 120-item slice automatically (outputs `slideshow-1.mp4`, `slideshow-2.mp4`, ...). For a single slice, combine `--chunk-size` with `--chunk-index`.
+
+### `find_duplicates.py`
+
+```
+python find_duplicates.py [root] [--follow-links] [--min-size BYTES] [--deep] [--hamming N]
+```
+- Walks the directory (default `sequence/`), hashes each file, and prints groups with identical byte signatures.
+- `--min-size` helps skip thumbnails; `--follow-links` inspects symlinked trees; adding `--deep` computes a perceptual hash to flag visually similar images within the chosen Hamming threshold (`--hamming`, default 5).
 
 ## Tips
 
