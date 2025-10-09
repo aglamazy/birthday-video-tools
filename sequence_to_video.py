@@ -303,6 +303,11 @@ def parse_args(config: dict[str, object]) -> argparse.Namespace:
         help="Only process the first N media files (useful for quick tests).",
     )
     parser.add_argument(
+        "--start-at",
+        type=str,
+        help="Begin processing at the first file whose name (case-sensitive) matches this value.",
+    )
+    parser.add_argument(
         "--chunk-size",
         type=int,
         default=default_chunk_size,
@@ -494,6 +499,15 @@ def main() -> None:
                 f"(chunk size {args.chunk_size}, total files {total_media})."
             )
             return
+
+    if args.start_at:
+        try:
+            start_index = next(
+                idx for idx, path in enumerate(selected_media) if path.name == args.start_at
+            )
+            selected_media = selected_media[start_index:]
+        except StopIteration:
+            raise SystemExit(f"--start-at {args.start_at} not found in source directory")
 
     if args.limit:
         selected_media = selected_media[: args.limit]

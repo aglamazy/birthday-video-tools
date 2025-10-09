@@ -134,6 +134,7 @@ python sequence_to_video.py [--source-dir sequence]
                             [--duration D] [--duration-overlay D] [--duration-text D]
                             [--label-year] [--label-font FONT]
                             [--debug-filename]
+                            [--start-at FILENAME]
                             [--chunk-size N] [--chunk-index M] [--batch]
                             [--audio-file track.mp3 ...]
                             [--verbose] [--debug-ffmpeg]
@@ -144,6 +145,7 @@ python sequence_to_video.py [--source-dir sequence]
   - `slideshow_with_audio.mp4` – muxed final video
 - `--limit` is invaluable for quick spot checks.
 - `--keep-temp` retains intermediate `segment_*.mp4` + subtitle PNGs for debugging.
+- `--start-at` jumps directly to the first file matching a given name (useful for resuming long renders).
 - `--debug-filename` overlays each slide's original filename in the top-left corner—handy when auditing sequences.
 - Audio cues: add `NNN.mp3` alongside `NNN.jpg` (or `.mp4`). Each cue plays until the next cue and crossfades over the transition.
 - Global mixes: pass `--audio-file background.mp3` to append a traditional soundtrack instead of per-slide cues.
