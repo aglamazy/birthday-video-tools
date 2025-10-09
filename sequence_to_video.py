@@ -9,7 +9,7 @@ import re
 import shutil
 import subprocess
 import tempfile
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Iterable, List, Optional, Sequence, Tuple
 
@@ -34,6 +34,7 @@ DEFAULT_CONFIG = {
 CONFIG_PATH = Path(__file__).resolve().parent / "config.json"
 
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".heic", ".heif"}
+AUDIO_EXTENSIONS = {".mp3", ".m4a", ".aac", ".wav", ".flac", ".ogg"}
 VIDEO_EXTENSIONS = {".mp4", ".mov", ".m4v", ".avi", ".mkv", ".hevc", ".mpg", ".mpeg", ".wmv"}
 TEXT_EXTENSIONS = {".txt", ".pug"}
 
@@ -42,6 +43,7 @@ LABEL_YEAR = False
 FONT_PATH: Optional[Path] = None
 SHOW_FILENAME = False
 FFMPEG_DEBUG = False
+CROSSFADE_SECONDS = 1.0
 def load_config(path: Path) -> dict[str, object]:
     config = DEFAULT_CONFIG.copy()
     if not path.exists():
@@ -178,6 +180,22 @@ class Segment:
     overlay_layout: Optional[TextLayout] = None
     panel_image: Optional[Path] = None
     overlay_subtitle: Optional[Path] = None
+    expected_duration: Optional[float] = None
+
+
+@dataclass(frozen=True)
+class AudioMarker:
+    path: Path
+    segment_index: int
+
+
+@dataclass(frozen=True)
+class AudioTimelineEntry:
+    path: Path
+    start: float
+    end: float
+    fade_in: float = 0.0
+    fade_out: float = 0.0
 
 
 class FFMpegError(RuntimeError):
@@ -400,6 +418,10 @@ def main() -> None:
     if not ffmpeg_path:
         raise SystemExit("ffmpeg is required but not found in PATH.")
 
+    ffprobe_path = shutil.which("ffprobe")
+    if not ffprobe_path:
+        print("Warning: ffprobe not found; precise video durations may be unavailable.")
+
     width, height = parse_resolution(args.resolution)
 
     source_dir = args.source_dir.resolve()
@@ -443,6 +465,7 @@ def main() -> None:
                 chunk_media,
                 args,
                 ffmpeg_path,
+                ffprobe_path,
                 width,
                 height,
                 output_path,
@@ -483,6 +506,7 @@ def main() -> None:
         selected_media,
         args,
         ffmpeg_path,
+        ffprobe_path,
         width,
         height,
         args.output,
@@ -494,6 +518,7 @@ def render_slideshow(
     media_files: List[Path],
     args: argparse.Namespace,
     ffmpeg_path: str,
+    ffprobe_path: Optional[str],
     width: int,
     height: int,
     output_path: Path,
@@ -522,6 +547,7 @@ def render_slideshow(
             overlay_text_paths.add(path)
 
     segments: List[Segment] = []
+    audio_markers: list[AudioMarker] = []
     tmp_dir_ctx = tempfile.TemporaryDirectory() if not args.keep_temp else None
     if tmp_dir_ctx is not None:
         temp_dir_path = Path(tmp_dir_ctx.name)
@@ -533,6 +559,7 @@ def render_slideshow(
     subtitle_temp_dir = temp_dir_path / "subtitles"
 
     segment_index = 0
+    segment_index_by_stem: dict[str, int] = {}
     for media in media_files:
         suffix = media.suffix.lower()
         if suffix in IMAGE_EXTENSIONS or suffix in VIDEO_EXTENSIONS:
@@ -561,6 +588,10 @@ def render_slideshow(
                     subtitle_temp_dir,
                     duration_value,
                 )
+            if suffix in IMAGE_EXTENSIONS:
+                expected_duration = duration_value or args.duration_image
+            else:
+                expected_duration = probe_media_duration(ffprobe_path, media)
             segments.append(
                 Segment(
                     source=media,
@@ -572,8 +603,10 @@ def render_slideshow(
                     duration=duration_value,
                     overlay_layout=overlay_layout,
                     overlay_subtitle=overlay_subtitle_path,
+                    expected_duration=expected_duration,
                 )
             )
+            segment_index_by_stem[media.stem] = len(segments) - 1
         elif suffix in TEXT_EXTENSIONS:
             if media in overlay_text_paths:
                 continue
@@ -596,8 +629,14 @@ def render_slideshow(
                     text_layout=text_layout,
                     duration=args.duration_text,
                     panel_image=panel_image,
+                    expected_duration=args.duration_text,
                 )
             )
+            segment_index_by_stem[media.stem] = len(segments) - 1
+        elif suffix in AUDIO_EXTENSIONS:
+            target_index = segment_index_by_stem.get(media.stem, len(segments))
+            audio_markers.append(AudioMarker(path=media, segment_index=target_index))
+            continue
         else:
             print(f"Skipping unsupported file {media.name}")
 
@@ -751,6 +790,18 @@ def render_slideshow(
                     )
                 )
 
+        if audio_markers:
+            if ffprobe_path is None:
+                print(
+                    "Warning: audio cues detected but ffprobe is unavailable; skipping timeline audio."
+                )
+                audio_entries = []
+            else:
+                segment_durations = ensure_segment_durations(ffprobe_path, segments)
+                audio_entries = build_audio_timeline(audio_markers, segment_durations)
+        else:
+            audio_entries = []
+
         run_ffmpeg(
             [
                 ffmpeg_path,
@@ -770,7 +821,15 @@ def render_slideshow(
             ]
         )
         print(f"Created {output_path}")
-        if resolved_audio_paths:
+        if audio_entries:
+            audio_output_path = output_path.with_name(f"{output_path.stem}_audio.mp3")
+            create_timeline_audio(ffmpeg_path, audio_entries, audio_output_path)
+            final_output_path = output_path.with_name(
+                f"{output_path.stem}_with_audio{output_path.suffix}"
+            )
+            mux_video_with_audio(ffmpeg_path, output_path, audio_output_path, final_output_path)
+            print(f"Created {final_output_path}")
+        elif resolved_audio_paths:
             apply_audio_track(ffmpeg_path, output_path, resolved_audio_paths)
     finally:
         if tmp_dir_ctx:
@@ -1099,6 +1158,206 @@ def escape_subtitle_path(path: Path) -> str:
     value = value.replace(":", r"\:")
     value = value.replace("'", r"\'")
     return value
+
+
+def probe_media_duration(ffprobe_path: Optional[str], media_path: Path) -> Optional[float]:
+    if not ffprobe_path:
+        return None
+    try:
+        result = subprocess.run(
+            [
+                ffprobe_path,
+                "-v",
+                "error",
+                "-show_entries",
+                "format=duration",
+                "-of",
+                "default=noprint_wrappers=1:nokey=1",
+                str(media_path),
+            ],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+    except (subprocess.CalledProcessError, OSError):
+        return None
+    text = result.stdout.strip()
+    if not text:
+        return None
+    try:
+        value = float(text)
+        if value <= 0:
+            return None
+        return value
+    except ValueError:
+        return None
+
+
+def ensure_segment_durations(
+    ffprobe_path: Optional[str], segments: Sequence[Segment]
+) -> list[float]:
+    durations: list[float] = []
+    for segment in segments:
+        duration = segment.expected_duration
+        if duration is None and ffprobe_path:
+            duration = probe_media_duration(ffprobe_path, segment.output)
+        if duration is None:
+            raise RuntimeError(f"Unable to determine duration for segment {segment.output}")
+        durations.append(duration)
+    return durations
+
+
+def build_audio_timeline(
+    audio_markers: Sequence[AudioMarker],
+    segment_durations: Sequence[float],
+) -> list[AudioTimelineEntry]:
+    if not audio_markers:
+        return []
+    cumulative: list[float] = [0.0]
+    for duration in segment_durations:
+        cumulative.append(cumulative[-1] + duration)
+
+    entries: list[AudioTimelineEntry] = []
+    total_segments = len(segment_durations)
+    for idx, marker in enumerate(audio_markers):
+        if marker.segment_index > total_segments:
+            continue
+        start = cumulative[marker.segment_index]
+        if idx + 1 < len(audio_markers):
+            next_index = audio_markers[idx + 1].segment_index
+            next_index = min(next_index, total_segments)
+            end = cumulative[next_index]
+        else:
+            end = cumulative[-1]
+        if end <= start:
+            continue
+        entries.append(AudioTimelineEntry(path=marker.path, start=start, end=end))
+
+    if not entries:
+        return []
+
+    adjusted = entries[:]
+    for idx in range(len(adjusted) - 1):
+        current_entry = adjusted[idx]
+        next_entry = adjusted[idx + 1]
+        current_duration = current_entry.end - current_entry.start
+        next_duration = next_entry.end - next_entry.start
+        if current_duration <= 0 or next_duration <= 0:
+            continue
+        fade_candidate = min(CROSSFADE_SECONDS, current_duration, next_duration)
+        if fade_candidate <= 0:
+            continue
+        fade = min(fade_candidate, next_entry.start)
+        if fade <= 0:
+            continue
+        current_entry = replace(current_entry, fade_out=fade)
+        new_start = max(0.0, next_entry.start - fade)
+        actual_fade_in = next_entry.start - new_start
+        next_entry = replace(next_entry, start=new_start, fade_in=actual_fade_in)
+        adjusted[idx] = current_entry
+        adjusted[idx + 1] = next_entry
+
+    return adjusted
+
+
+def create_timeline_audio(
+    ffmpeg_path: str,
+    entries: Sequence[AudioTimelineEntry],
+    output_path: Path,
+) -> None:
+    if not entries:
+        return
+
+    filter_parts: list[str] = []
+    mix_inputs: list[str] = []
+    input_args: list[str] = []
+
+    for idx, entry in enumerate(entries):
+        duration = entry.end - entry.start
+        if duration <= 0:
+            continue
+        input_args.extend(["-i", str(entry.path)])
+        stream_label = f"aud{idx}"
+        start_ms = max(0, int(round(entry.start * 1000)))
+        trim_clause = f"[{idx}:a]atrim=0:{duration:.6f},asetpts=PTS-STARTPTS"
+        fade_clauses: list[str] = []
+        if entry.fade_in > 0:
+            fade_clauses.append(f"afade=t=in:st=0:d={entry.fade_in:.6f}")
+        if entry.fade_out > 0 and duration > entry.fade_out:
+            fade_start = duration - entry.fade_out
+            fade_clauses.append(
+                f"afade=t=out:st={fade_start:.6f}:d={entry.fade_out:.6f}"
+            )
+        filter_expr = trim_clause
+        for clause in fade_clauses:
+            filter_expr += f",{clause}"
+        filter_expr += f",adelay={start_ms}|{start_ms}[{stream_label}]"
+        filter_parts.append(filter_expr)
+        mix_inputs.append(f"[{stream_label}]")
+
+    if not filter_parts:
+        raise RuntimeError("No usable audio timeline entries were produced.")
+
+    mix_count = len(mix_inputs)
+    mix_clause = "".join(mix_inputs)
+    filter_parts.append(
+        f"{mix_clause}amix=inputs={mix_count}:dropout_transition=0,"
+        "aformat=sample_fmts=s16:sample_rates=44100:channel_layouts=stereo[mix]"
+    )
+    filter_graph = ";".join(filter_parts)
+
+    cmd = [
+        ffmpeg_path,
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        *input_args,
+        "-filter_complex",
+        filter_graph,
+        "-map",
+        "[mix]",
+        "-c:a",
+        "libmp3lame",
+        "-ar",
+        "44100",
+        "-b:a",
+        "192k",
+        "-y",
+        str(output_path),
+    ]
+    run_ffmpeg(cmd)
+
+
+def mux_video_with_audio(
+    ffmpeg_path: str,
+    video_path: Path,
+    audio_path: Path,
+    output_path: Path,
+) -> None:
+    cmd = [
+        ffmpeg_path,
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-y",
+        "-i",
+        str(video_path),
+        "-i",
+        str(audio_path),
+        "-map",
+        "0:v:0",
+        "-map",
+        "1:a:0",
+        "-c:v",
+        "copy",
+        "-c:a",
+        "aac",
+        "-b:a",
+        "192k",
+        "-shortest",
+        str(output_path),
+    ]
+    run_ffmpeg(cmd)
 
 
 def build_text_segment_cmd(
