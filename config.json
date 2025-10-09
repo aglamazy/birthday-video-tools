@@ -1,0 +1,17 @@
+{
+  "source_dir": "sequence",
+  "output": "slideshow.mp4",
+  "duration_image": 2.0,
+  "duration_overlay": 4.0,
+  "duration_text": 4.0,
+  "fps": 30,
+  "resolution": "1920x1080",
+  "chunk_size": null,
+  "chunk_index": null,
+  "debug_filename": false,
+  "audio_files": [],
+  "transitions": {
+    "enabled": false,
+    "allowed": []
+  }
+}
