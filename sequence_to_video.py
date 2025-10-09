@@ -13,6 +13,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, List, Optional, Sequence, Tuple
 
+from subtitle_renderer import create_ass_subtitle
+from text_renderer import render_text_panel
 from text_utils import TextLayout, combine_overlay_texts, load_text_layout
 
 DEFAULT_CONFIG = {
@@ -39,8 +41,6 @@ VERBOSE = False
 LABEL_YEAR = False
 FONT_PATH: Optional[Path] = None
 SHOW_FILENAME = False
-
-
 def load_config(path: Path) -> dict[str, object]:
     config = DEFAULT_CONFIG.copy()
     if not path.exists():
@@ -174,6 +174,9 @@ class Segment:
     overlay_text: Optional[str] = None
     overlay_sources: tuple[Path, ...] = ()
     duration: Optional[float] = None
+    overlay_layout: Optional[TextLayout] = None
+    panel_image: Optional[Path] = None
+    overlay_subtitle: Optional[Path] = None
 
 
 class FFMpegError(RuntimeError):
@@ -517,6 +520,9 @@ def render_slideshow(
         temp_dir_path = output_path.parent / ".segments"
         temp_dir_path.mkdir(parents=True, exist_ok=True)
 
+    text_panel_temp_dir = temp_dir_path / "text_panels"
+    subtitle_temp_dir = temp_dir_path / "subtitles"
+
     segment_index = 0
     for media in media_files:
         suffix = media.suffix.lower()
@@ -525,14 +531,26 @@ def render_slideshow(
             segment_path = temp_dir_path / f"segment_{segment_index:04d}.mp4"
             overlay_sources = overlay_text_map.get(media.stem, [])
             overlay_text_value: Optional[str] = None
+            overlay_layout: Optional[TextLayout] = None
+            overlay_subtitle_path: Optional[Path] = None
             if overlay_sources:
-                combined = combine_overlay_texts(overlay_sources)
-                if combined:
-                    overlay_text_value = combined
+                combined_layout = combine_overlay_texts(overlay_sources)
+                if combined_layout.lines:
+                    overlay_layout = combined_layout
+                    overlay_text_value = combined_layout.overlay_text()
             duration_value: Optional[float] = None
             if suffix in IMAGE_EXTENSIONS:
                 duration_value = (
                     args.duration_overlay if overlay_text_value else args.duration_image
+                )
+            if overlay_text_value:
+                overlay_subtitle_path = create_ass_subtitle(
+                    overlay_text_value,
+                    width,
+                    height,
+                    FONT_PATH,
+                    subtitle_temp_dir,
+                    duration_value,
                 )
             segments.append(
                 Segment(
@@ -543,6 +561,8 @@ def render_slideshow(
                     overlay_text=overlay_text_value,
                     overlay_sources=tuple(overlay_sources),
                     duration=duration_value,
+                    overlay_layout=overlay_layout,
+                    overlay_subtitle=overlay_subtitle_path,
                 )
             )
         elif suffix in TEXT_EXTENSIONS:
@@ -551,6 +571,14 @@ def render_slideshow(
             segment_index += 1
             segment_path = temp_dir_path / f"segment_{segment_index:04d}.mp4"
             text_layout = load_text_layout(media)
+            panel_image = render_text_panel(
+                text_layout,
+                width,
+                height,
+                FONT_PATH,
+                background=True,
+                output_dir=text_panel_temp_dir,
+            )
             segments.append(
                 Segment(
                     source=media,
@@ -558,6 +586,7 @@ def render_slideshow(
                     kind="text",
                     text_layout=text_layout,
                     duration=args.duration_text,
+                    panel_image=panel_image,
                 )
             )
         else:
@@ -612,6 +641,7 @@ def render_slideshow(
                     segment.overlay_text,
                     label,
                     debug_text,
+                    segment.overlay_subtitle,
                 )
                 run_ffmpeg(
                     [
@@ -663,6 +693,7 @@ def render_slideshow(
                     segment.overlay_text,
                     label,
                     debug_text,
+                    segment.overlay_subtitle,
                 )
                 run_ffmpeg(
                     [
@@ -755,6 +786,7 @@ def build_media_filter_graph(
     overlay_text: Optional[str],
     label_text: Optional[str],
     debug_text: Optional[str],
+    overlay_subtitle: Optional[Path] = None,
 ) -> tuple[str, str]:
     label_counter = 0
 
@@ -773,18 +805,25 @@ def build_media_filter_graph(
     ]
     steps.append(f"[0:v]{','.join(base_filters)}[{current}]")
 
-    def append_drawtext(filter_expr: str) -> None:
+    def append_filter(filter_expr: str) -> None:
         nonlocal current
         next_out = next_label()
         steps.append(f"[{current}]{filter_expr}[{next_out}]")
         current = next_out
 
-    if overlay_text:
+    if overlay_subtitle:
+        subtitle_path = escape_subtitle_path(overlay_subtitle)
+        subtitle_filter = f"subtitles='{subtitle_path}'"
+        if FONT_PATH:
+            fonts_dir = escape_subtitle_path(FONT_PATH.parent)
+            subtitle_filter += f":fontsdir='{fonts_dir}'"
+        append_filter(subtitle_filter)
+    elif overlay_text:
         overlay_font_clause = (
             f"fontfile='{escape_drawtext(FONT_PATH.as_posix())}':" if FONT_PATH else ""
         )
         overlay_value = escape_drawtext(overlay_text)
-        append_drawtext(
+        append_filter(
             f"drawtext={overlay_font_clause}text='{overlay_value}':fontsize=52:"
             "line_spacing=16:fontcolor=white:borderw=3:bordercolor=black:text_shaping=1:"
             "x=(w-text_w)/2:y=(h-text_h)/2"
@@ -795,7 +834,7 @@ def build_media_filter_graph(
             f"fontfile='{escape_drawtext(FONT_PATH.as_posix())}':" if FONT_PATH else ""
         )
         label_value = escape_drawtext(label_text)
-        append_drawtext(
+        append_filter(
             f"drawtext={font_clause}text='{label_value}':fontsize=48:fontcolor=white:"
             "box=1:boxcolor=0x00000088:text_shaping=1:x=w-tw-40:y=h-th-40"
         )
@@ -805,7 +844,7 @@ def build_media_filter_graph(
             f"fontfile='{escape_drawtext(FONT_PATH.as_posix())}':" if FONT_PATH else ""
         )
         debug_value = escape_drawtext(debug_text)
-        append_drawtext(
+        append_filter(
             f"drawtext={debug_font_clause}text='{debug_value}':fontsize=32:"
             "fontcolor=white:borderw=2:bordercolor=black:text_shaping=1:"
             "x=40:y=40"
@@ -837,25 +876,68 @@ def build_text_filter_graph(
         f"fontfile='{escape_drawtext(FONT_PATH.as_posix())}':" if FONT_PATH else ""
     )
 
+    title_font_size = 72
+    body_font_size = 56
+    body_spacing = 22
+    indent_px = 70
+    margin_right = 120
+
     if layout.title:
-        title_value = escape_drawtext(layout.title)
+        title_text = layout.title.strip()
+        title_value = escape_drawtext(title_text)
         title_label = next_label()
         steps.append(
-            f"[{current}]drawtext={font_clause}text='{title_value}':fontsize=72:"
+            f"[{current}]drawtext={font_clause}text='{title_value}':fontsize={title_font_size}:"
             "fontcolor=white:borderw=3:bordercolor=black:text_shaping=1:"
-            "x=(w-text_w)/2:y=140"
+            "x=w-text_w-120:y=80"
             f"[{title_label}]"
         )
         current = title_label
 
-    if any(line.strip() for line in layout.body_lines):
-        body_value = escape_drawtext("\n".join(layout.body_lines))
+    body_lines = [line for line in layout.lines if line.kind not in {"blank", "top"} and line.display.strip()]
+    line_height = body_font_size + body_spacing
+    top_lines = [line for line in layout.lines if line.kind == "top" and line.display.strip()]
+    top_base_y = 140
+    top_index = 0
+
+    if layout.title:
+        base_body_y = top_base_y + len(top_lines) * line_height + 40
+    else:
+        base_body_y = top_base_y + len(top_lines) * line_height
+
+    if body_lines:
+        current_y = base_body_y
+    else:
+        current_y = base_body_y
+
+    if not body_lines and not top_lines and not layout.title:
+        current_y = max((height - line_height) // 2, 120)
+
+    for line in layout.lines:
+        if line.kind == "blank":
+            continue
+        display_text = line.display.strip()
+        if not display_text:
+            continue
+        escaped_display = escape_drawtext(display_text)
+
+        if line.align == "center":
+            x_expr = "(w-text_w)/2"
+            y_expr = str(current_y)
+            current_y += line_height
+        elif line.align == "top":
+            x_expr = "w-text_w-120"
+            y_expr = str(top_base_y + top_index * line_height)
+            top_index += 1
+        else:
+            x_expr = f"w-text_w-{margin_right + line.level * indent_px}"
+            y_expr = str(current_y)
+            current_y += line_height
+
         body_label = next_label()
-        x_expr = "120" if layout.direction == "ltr" else "w-text_w-120"
-        y_expr = "260" if layout.title else "(h-text_h)/2"
         steps.append(
-            f"[{current}]drawtext={font_clause}text='{body_value}':fontsize=56:"
-            "line_spacing=22:fontcolor=white:box=1:boxcolor=0x00000088:text_shaping=1:"
+            f"[{current}]drawtext={font_clause}text='{escaped_display}':fontsize={body_font_size}:"
+            "fontcolor=white:box=1:boxcolor=0x00000088:text_shaping=1:"
             f"x={x_expr}:y={y_expr}"
             f"[{body_label}]"
         )
@@ -995,6 +1077,14 @@ def escape_drawtext(value: str) -> str:
     return value.replace("\\", r"\\").replace("'", r"\'")
 
 
+def escape_subtitle_path(path: Path) -> str:
+    value = path.as_posix()
+    value = value.replace("\\", r"\\")
+    value = value.replace(":", r"\:")
+    value = value.replace("'", r"\'")
+    return value
+
+
 def build_text_segment_cmd(
     ffmpeg_path: str,
     layout: TextLayout,
@@ -1012,7 +1102,6 @@ def build_text_segment_cmd(
         layout,
         debug_text,
     )
-
     return [
         ffmpeg_path,
         "-hide_banner",

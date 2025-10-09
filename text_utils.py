@@ -4,20 +4,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, List
 
-HEBREW_RANGES = (
-    (0x0590, 0x05FF),
-    (0xFB1D, 0xFB4F),
-)
-
-
-def _is_hebrew_char(char: str) -> bool:
-    if not char:
-        return False
-    codepoint = ord(char)
-    for start, end in HEBREW_RANGES:
-        if start <= codepoint <= end:
-            return True
-    return False
+BULLET_PREFIXES = ("•", "-", "*")
 
 
 def _normalize_indent(raw_line: str) -> str:
@@ -30,42 +17,49 @@ def _indent_level(raw_line: str) -> int:
     return leading // 2
 
 
-def _strip_bullet(text: str) -> str:
-    return text.lstrip("-").strip()
+def _extract_bullet(text: str) -> tuple[bool, str]:
+    stripped = text.strip()
+    if not stripped:
+        return False, ""
+    for marker in BULLET_PREFIXES:
+        if stripped.startswith(marker):
+            remainder = stripped[len(marker) :].strip()
+            return True, remainder
+    return False, stripped
 
 
-def detect_text_direction(text: str) -> str:
-    hebrew_count = 0
-    latin_count = 0
-    for char in text:
-        if _is_hebrew_char(char):
-            hebrew_count += 1
-        elif char.isalpha():
-            latin_count += 1
-    if hebrew_count > 0 and hebrew_count >= latin_count:
-        return "rtl"
-    return "ltr"
+@dataclass(frozen=True)
+class LineInfo:
+    kind: str  # "blank", "bullet", "text", "center", "top"
+    level: int
+    text: str
+    display: str
+    align: str  # "right", "center", or "top"
 
 
 @dataclass(frozen=True)
 class TextLayout:
     title: str | None
-    body_lines: List[str]
-    direction: str  # "ltr" or "rtl"
+    lines: List[LineInfo]
+
+    @property
+    def body_lines(self) -> List[str]:
+        return [line.display for line in self.lines]
 
     def overlay_text(self) -> str:
         parts: List[str] = []
         if self.title:
             parts.append(self.title)
-        if self.body_lines:
-            parts.append("\n".join(self.body_lines))
+        body = "\n".join(self.body_lines).strip()
+        if body:
+            parts.append(body)
         return "\n\n".join(part for part in parts if part).strip()
 
     def preview_text(self) -> str:
         if self.title:
-            return self.title
-        for line in self.body_lines:
-            candidate = line.strip()
+            return self.title.strip()
+        for line in self.lines:
+            candidate = line.text.strip()
             if candidate:
                 return candidate
         return ""
@@ -78,48 +72,53 @@ def load_text_layout(path: Path) -> TextLayout:
         raw_content = path.read_text(encoding="utf-8", errors="replace")
 
     title: str | None = None
-    body_lines: List[str] = []
+    lines: List[LineInfo] = []
 
     for raw_line in raw_content.splitlines():
         if not raw_line.strip():
-            body_lines.append("")
+            lines.append(LineInfo("blank", 0, "", "", align="right"))
             continue
+
         stripped = raw_line.strip()
         if stripped.startswith("#"):
-            candidate = stripped.lstrip("#").strip()
-            if candidate and title is None:
-                title = candidate
+            token = stripped.lstrip("#").strip()
+            if title is None and token:
+                title = token
                 continue
-            stripped = candidate or stripped.lstrip("#")
-        indent = "  " * _indent_level(raw_line)
-        if stripped.startswith("-"):
-            item_text = _strip_bullet(stripped)
-            if not item_text:
-                item_text = "-"
-            line = f"{indent}• {item_text}"
+            stripped = token
+            if stripped:
+                lines.append(LineInfo("top", 0, stripped, stripped, align="top"))
+            continue
+
+        level = _indent_level(raw_line)
+        is_bullet, bullet_text = _extract_bullet(stripped)
+        if is_bullet:
+            text = bullet_text if bullet_text else "-"
+            display = f"{text}\u00A0•"
+            lines.append(LineInfo("bullet", level, text, display, align="right"))
         else:
-            line = f"{indent}{stripped}"
-        body_lines.append(line)
+            display = stripped
+            lines.append(LineInfo("text", level, stripped, display, align="right"))
 
-    hydrated_text = " ".join(
-        part for part in ([title] if title else []) + [line for line in body_lines if line]
-    )
-
-    if not title and not any(line.strip() for line in body_lines):
+    if title is None and not any(line.text for line in lines if line.kind != "blank"):
         fallback = path.stem
         title = fallback
-        body_lines = []
-        hydrated_text = fallback
+        lines = []
+        lines.append(LineInfo("text", 0, fallback, fallback, align="right"))
 
-    direction = detect_text_direction(hydrated_text)
-    return TextLayout(title=title, body_lines=body_lines, direction=direction)
+    layout = TextLayout(title=title, lines=lines)
+
+    return layout
 
 
-def combine_overlay_texts(paths: Iterable[Path]) -> str:
-    blocks: List[str] = []
+def combine_overlay_texts(paths: Iterable[Path]) -> TextLayout:
+    combined_lines: List[LineInfo] = []
     for overlay_path in paths:
         layout = load_text_layout(overlay_path)
-        text = layout.overlay_text()
-        if text:
-            blocks.append(text)
-    return "\n\n".join(blocks).strip()
+        for line in layout.lines:
+            if line.kind == "blank":
+                continue
+            if not line.display.strip():
+                continue
+            combined_lines.append(line)
+    return TextLayout(title=None, lines=combined_lines)
