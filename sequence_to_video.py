@@ -41,6 +41,7 @@ VERBOSE = False
 LABEL_YEAR = False
 FONT_PATH: Optional[Path] = None
 SHOW_FILENAME = False
+FFMPEG_DEBUG = False
 def load_config(path: Path) -> dict[str, object]:
     config = DEFAULT_CONFIG.copy()
     if not path.exists():
@@ -338,7 +339,12 @@ def parse_args(config: dict[str, object]) -> argparse.Namespace:
     parser.add_argument(
         "--verbose",
         action="store_true",
-        help="Print ffmpeg commands before executing them.",
+        help="Show additional progress while keeping ffmpeg logs visible.",
+    )
+    parser.add_argument(
+        "--debug-ffmpeg",
+        action="store_true",
+        help="Print each ffmpeg command before execution (implies --verbose).",
     )
     parser.add_argument(
         "--label-year",
@@ -356,8 +362,11 @@ def parse_args(config: dict[str, object]) -> argparse.Namespace:
 def main() -> None:
     config = load_config(CONFIG_PATH)
     args = parse_args(config)
-    global VERBOSE
+    if args.debug_ffmpeg:
+        args.verbose = True
+    global VERBOSE, FFMPEG_DEBUG
     VERBOSE = args.verbose
+    FFMPEG_DEBUG = args.debug_ffmpeg
     global LABEL_YEAR, FONT_PATH, SHOW_FILENAME
     LABEL_YEAR = args.label_year
     SHOW_FILENAME = args.debug_filename
@@ -969,7 +978,7 @@ def build_text_filter_graph(
 
 def run_ffmpeg(cmd: Iterable[str]) -> None:
     args_list = list(cmd)
-    if VERBOSE:
+    if FFMPEG_DEBUG:
         print("Running:", " ".join(args_list))
     result = subprocess.run(args_list, capture_output=not VERBOSE, text=True)
     if result.returncode != 0:
