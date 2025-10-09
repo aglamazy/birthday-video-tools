@@ -9,11 +9,13 @@ from PIL import Image, ImageDraw, ImageFont
 from text_utils import LineInfo, TextLayout
 
 RIGHT_MARGIN = 120
+LEFT_MARGIN = 120
 TOP_MARGIN = 80
 TOP_LINE_SPACING = 20
 BODY_LINE_SPACING = 22
 TITLE_FONT_SIZE = 72
 BODY_FONT_SIZE = 56
+INDENT_WIDTH = 70
 BACKGROUND_COLOR = (16, 16, 16, 255)
 TEXT_COLOR = (255, 255, 255, 255)
 BOX_COLOR = (0, 0, 0, 136)
@@ -70,8 +72,8 @@ def render_text_panel(
             draw,
             layout.title,
             title_font,
-            (width - RIGHT_MARGIN, TOP_MARGIN),
-            anchor="ra",
+            (width // 2, TOP_MARGIN),
+            anchor="ma",
         )
         top_start_y = TOP_MARGIN + TITLE_FONT_SIZE + TOP_LINE_SPACING
     else:
@@ -96,9 +98,12 @@ def render_text_panel(
         if line.align == "center":
             anchor = "ma"
             pos = (width // 2, current_y)
+        elif line.align == "left":
+            anchor = "la"
+            pos = (LEFT_MARGIN + line.level * INDENT_WIDTH, current_y)
         else:
             anchor = "ra"
-            pos = (width - RIGHT_MARGIN - line.level * 70, current_y)
+            pos = (width - RIGHT_MARGIN - line.level * INDENT_WIDTH, current_y)
         _draw_text(draw, line.display, body_font, pos, anchor)
         current_y += line_height
 

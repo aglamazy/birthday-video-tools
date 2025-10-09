@@ -5,6 +5,8 @@ from pathlib import Path
 from typing import Iterable, List
 
 BULLET_PREFIXES = ("•", "-", "*")
+RTL_HEBREW_START = ord("\u0590")
+RTL_HEBREW_END = ord("\u05FF")
 
 
 def _normalize_indent(raw_line: str) -> str:
@@ -28,13 +30,29 @@ def _extract_bullet(text: str) -> tuple[bool, str]:
     return False, stripped
 
 
+def _is_rtl(text: str) -> bool:
+    for char in text:
+        code = ord(char)
+        if RTL_HEBREW_START <= code <= RTL_HEBREW_END:
+            return True
+    return False
+
+
+def is_rtl_text(text: str) -> bool:
+    return _is_rtl(text)
+
+
+def _line_alignment(text: str) -> str:
+    return "right" if is_rtl_text(text) else "left"
+
+
 @dataclass(frozen=True)
 class LineInfo:
     kind: str  # "blank", "bullet", "text", "center", "top"
     level: int
     text: str
     display: str
-    align: str  # "right", "center", or "top"
+    align: str  # "left", "right", "center", or "top"
 
 
 @dataclass(frozen=True)
@@ -94,17 +112,23 @@ def load_text_layout(path: Path) -> TextLayout:
         is_bullet, bullet_text = _extract_bullet(stripped)
         if is_bullet:
             text = bullet_text if bullet_text else "-"
-            display = f"{text}\u00A0•"
-            lines.append(LineInfo("bullet", level, text, display, align="right"))
+            align = _line_alignment(text)
+            if align == "right":
+                display = f"{text}\u00A0•"
+            else:
+                display = f"•\u00A0{text}"
+            lines.append(LineInfo("bullet", level, text, display, align=align))
         else:
             display = stripped
-            lines.append(LineInfo("text", level, stripped, display, align="right"))
+            align = _line_alignment(stripped)
+            lines.append(LineInfo("text", level, stripped, display, align=align))
 
     if title is None and not any(line.text for line in lines if line.kind != "blank"):
         fallback = path.stem
         title = fallback
         lines = []
-        lines.append(LineInfo("text", 0, fallback, fallback, align="right"))
+        fallback_align = _line_alignment(fallback)
+        lines.append(LineInfo("text", 0, fallback, fallback, align=fallback_align))
 
     layout = TextLayout(title=title, lines=lines)
 
@@ -113,12 +137,15 @@ def load_text_layout(path: Path) -> TextLayout:
 
 def combine_overlay_texts(paths: Iterable[Path]) -> TextLayout:
     combined_lines: List[LineInfo] = []
+    title: str | None = None
     for overlay_path in paths:
         layout = load_text_layout(overlay_path)
+        if title is None and layout.title:
+            title = layout.title
         for line in layout.lines:
             if line.kind == "blank":
                 continue
             if not line.display.strip():
                 continue
             combined_lines.append(line)
-    return TextLayout(title=None, lines=combined_lines)
+    return TextLayout(title=title, lines=combined_lines)

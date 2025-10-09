@@ -5,6 +5,18 @@ from typing import Optional
 
 from PIL import ImageFont
 
+from text_renderer import (
+    BODY_FONT_SIZE,
+    BODY_LINE_SPACING,
+    INDENT_WIDTH,
+    LEFT_MARGIN,
+    RIGHT_MARGIN,
+    TITLE_FONT_SIZE,
+    TOP_LINE_SPACING,
+    TOP_MARGIN,
+)
+from text_utils import TextLayout, is_rtl_text
+
 
 def _escape_ass_text(text: str) -> str:
     escaped = text.replace("\\", r"\\")
@@ -49,24 +61,101 @@ def _next_output_path(output_dir: Path, prefix: str, suffix: str) -> Path:
         counter += 1
 
 
+def _line_height() -> int:
+    return BODY_FONT_SIZE + BODY_LINE_SPACING
+
+
 def create_ass_subtitle(
-    text: str,
+    layout: TextLayout,
     width: int,
     height: int,
     font_path: Optional[Path],
     output_dir: Path,
     duration: Optional[float] = None,
 ) -> Path:
-    normalized = text.strip()
-    if not normalized:
-        raise ValueError("Cannot create ASS subtitle from empty text.")
+    has_title = bool(layout.title and layout.title.strip())
+    lines = list(layout.lines)
+    has_line_content = any(
+        line.display.strip() for line in lines if line.kind != "blank"
+    )
+    if not has_title and not has_line_content:
+        raise ValueError("Cannot create ASS subtitle from empty layout.")
 
     output_dir.mkdir(parents=True, exist_ok=True)
     subtitle_path = _next_output_path(output_dir, "overlay", ".ass")
 
     font_name = _resolve_font_name(font_path)
-    ass_text = _escape_ass_text(normalized)
     end_time = _format_ass_time(duration)
+    line_height = _line_height()
+
+    dialogues: list[str] = []
+
+    def add_dialogue(
+        alignment: int,
+        x_pos: int,
+        y_pos: int,
+        text: str,
+        direction: Optional[str] = None,
+    ) -> None:
+        if not text:
+            return
+        escaped = _escape_ass_text(text)
+        overrides = [f"\\an{alignment}", f"\\pos({x_pos},{y_pos})"]
+        if direction == "rtl":
+            overrides.append("\\rtl")
+        elif direction == "ltr":
+            overrides.append("\\ltr")
+        override_block = "".join(overrides)
+        dialogues.append(
+            f"Dialogue: 0,0:00:00.00,{end_time},Overlay,,0,0,0,,"
+            f"{{{override_block}}}{escaped}"
+        )
+
+    top_lines = [line for line in lines if line.align == "top" and line.display.strip()]
+    body_lines = [line for line in lines if line.align != "top"]
+
+    if has_title:
+        title_direction = "rtl" if is_rtl_text(layout.title) else "ltr"
+        add_dialogue(8, width // 2, TOP_MARGIN, layout.title.strip(), title_direction)
+        top_base_y = TOP_MARGIN + TITLE_FONT_SIZE + TOP_LINE_SPACING
+    else:
+        top_base_y = TOP_MARGIN
+
+    for index, line in enumerate(top_lines):
+        y_pos = top_base_y + index * line_height
+        line_text = line.text if line.text else line.display
+        direction = "rtl" if is_rtl_text(line_text) else "ltr"
+        add_dialogue(9, width - RIGHT_MARGIN, y_pos, line.display.strip(), direction)
+
+    body_start_y = top_base_y + len(top_lines) * line_height
+    if has_title or top_lines:
+        body_start_y += 40
+
+    current_y = body_start_y
+    for line in body_lines:
+        if line.kind == "blank":
+            current_y += line_height
+            continue
+        if not line.display.strip():
+            current_y += line_height
+            continue
+        align = line.align
+        line_text = line.text if line.text else line.display
+        direction = "rtl" if is_rtl_text(line_text) else "ltr"
+        if align == "center":
+            alignment = 8
+            x_pos = width // 2
+        elif align == "left":
+            alignment = 7
+            x_pos = LEFT_MARGIN + line.level * INDENT_WIDTH
+        else:  # treat "right" and any fallback as right-aligned
+            alignment = 9
+            x_pos = width - RIGHT_MARGIN - line.level * INDENT_WIDTH
+        add_dialogue(alignment, x_pos, current_y, line.display.strip(), direction)
+        current_y += line_height
+
+    if not dialogues:
+        raise ValueError("Cannot create ASS subtitle from empty layout.")
 
     subtitle_contents = "\n".join(
         [
@@ -90,10 +179,9 @@ def create_ass_subtitle(
             "",
             "[Events]",
             "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text",
-            f"Dialogue: 0,0:00:00.00,{end_time},Overlay,,0,0,0,,{{\\an8}}{ass_text}",
+            *dialogues,
         ]
     )
 
     subtitle_path.write_text(subtitle_contents, encoding="utf-8")
     return subtitle_path
-

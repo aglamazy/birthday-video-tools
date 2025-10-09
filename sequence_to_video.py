@@ -14,7 +14,7 @@ from pathlib import Path
 from typing import Iterable, List, Optional, Sequence, Tuple
 
 from subtitle_renderer import create_ass_subtitle
-from text_renderer import render_text_panel
+from text_renderer import INDENT_WIDTH, LEFT_MARGIN, render_text_panel
 from text_utils import TextLayout, combine_overlay_texts, load_text_layout
 
 DEFAULT_CONFIG = {
@@ -535,7 +535,7 @@ def render_slideshow(
             overlay_subtitle_path: Optional[Path] = None
             if overlay_sources:
                 combined_layout = combine_overlay_texts(overlay_sources)
-                if combined_layout.lines:
+                if combined_layout.lines or combined_layout.title:
                     overlay_layout = combined_layout
                     overlay_text_value = combined_layout.overlay_text()
             duration_value: Optional[float] = None
@@ -543,9 +543,9 @@ def render_slideshow(
                 duration_value = (
                     args.duration_overlay if overlay_text_value else args.duration_image
                 )
-            if overlay_text_value:
+            if overlay_layout and overlay_text_value:
                 overlay_subtitle_path = create_ass_subtitle(
-                    overlay_text_value,
+                    overlay_layout,
                     width,
                     height,
                     FONT_PATH,
@@ -879,8 +879,9 @@ def build_text_filter_graph(
     title_font_size = 72
     body_font_size = 56
     body_spacing = 22
-    indent_px = 70
+    indent_px = INDENT_WIDTH
     margin_right = 120
+    margin_left = LEFT_MARGIN
 
     if layout.title:
         title_text = layout.title.strip()
@@ -889,7 +890,7 @@ def build_text_filter_graph(
         steps.append(
             f"[{current}]drawtext={font_clause}text='{title_value}':fontsize={title_font_size}:"
             "fontcolor=white:borderw=3:bordercolor=black:text_shaping=1:"
-            "x=w-text_w-120:y=80"
+            "x=(w-text_w)/2:y=80"
             f"[{title_label}]"
         )
         current = title_label
@@ -915,9 +916,11 @@ def build_text_filter_graph(
 
     for line in layout.lines:
         if line.kind == "blank":
+            current_y += line_height
             continue
         display_text = line.display.strip()
         if not display_text:
+            current_y += line_height
             continue
         escaped_display = escape_drawtext(display_text)
 
@@ -929,6 +932,10 @@ def build_text_filter_graph(
             x_expr = "w-text_w-120"
             y_expr = str(top_base_y + top_index * line_height)
             top_index += 1
+        elif line.align == "left":
+            x_expr = f"{margin_left + line.level * indent_px}"
+            y_expr = str(current_y)
+            current_y += line_height
         else:
             x_expr = f"w-text_w-{margin_right + line.level * indent_px}"
             y_expr = str(current_y)
