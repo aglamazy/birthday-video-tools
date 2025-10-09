@@ -13,9 +13,9 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Iterable, List, Optional, Sequence, Tuple
 
-from subtitle_renderer import create_ass_subtitle
-from text_renderer import INDENT_WIDTH, LEFT_MARGIN, render_text_panel
-from text_utils import TextLayout, combine_overlay_texts, load_text_layout
+from lib.subtitle_renderer import create_ass_subtitle
+from lib.text_renderer import INDENT_WIDTH, LEFT_MARGIN, render_text_panel
+from lib.text_utils import TextLayout, combine_overlay_texts, load_text_layout
 
 DEFAULT_CONFIG = {
     "source_dir": "sequence",

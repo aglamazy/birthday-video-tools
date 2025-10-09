@@ -6,7 +6,7 @@ from typing import Iterable, Optional, Tuple
 
 from PIL import Image, ImageDraw, ImageFont
 
-from text_utils import LineInfo, TextLayout
+from .text_utils import LineInfo, TextLayout
 
 RIGHT_MARGIN = 120
 LEFT_MARGIN = 120

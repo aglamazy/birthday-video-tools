@@ -1,6 +1,6 @@
 # Photo Sequence Toolkit
 
-Utilities for organising a raw photo dump into dated folders, generating a chronological `sequence/` directory, converting HEIC assets, and producing an MP4 slideshow with optional overlays.
+Utilities for organising a raw photo dump into dated folders, generating a chronological `sequence/` directory, converting HEIC assets, producing an MP4 slideshow (with overlays + timed audio cues), and trimming audio clips for that workflow.
 
 ## Project Layout
 
@@ -9,7 +9,9 @@ Utilities for organising a raw photo dump into dated folders, generating a chron
 - `photo_sorter.py` – moves recognisable files in `data/` into `data/YYYY/yyyymmdd-ii.ext`
 - `sequence_builder.py` – copies the organised tree into the single `sequence/` folder
 - `convert_heic.py` – converts/renames HEIC/HEIF files within `sequence/`
-- `sequence_to_video.py` – renders the slideshow MP4 from `sequence/`
+- `sequence_to_video.py` – renders the slideshow MP4 (and optional timeline audio)
+- `extract_audio.py` – trims audio out of a video file into an MP3 snippet
+- `lib/` – shared helpers used by the renderer (`text_utils.py`, `text_renderer.py`, `subtitle_renderer.py`)
 
 ## Environment Setup
 
@@ -53,17 +55,27 @@ Utilities for organising a raw photo dump into dated folders, generating a chron
    # Add --dry-run to inspect without writing
    ```
 
-4. **Generate the slideshow video**
+4. **Trim supporting audio (optional)**
    ```bash
-   # Quick preview (first 10 entries, verbose ffmpeg, and year labels)
+   # Remove 2 s of lead-in silence and export the full soundtrack
+   python extract_audio.py raw_clip.mp4 --trim-start 2 -o cleaned_intro.mp3
+
+   # Extract a 30 s highlight starting 10 s into the source
+   python extract_audio.py raw_clip.mp4 30 --start 10 --trim-start 0.5 -o highlight.mp3
+   ```
+
+5. **Generate the slideshow video**
+   ```bash
+   # Quick preview (first 10 entries, verbose progress, and year labels)
    python sequence_to_video.py --limit 10 --label-year --verbose
 
-   # Full render with overlays and custom font
+   # Full render with text overlays, custom font, and timeline audio cues
    python sequence_to_video.py --label-year --label-font /path/to/YourFont.ttf
    ```
 
-   - Text slides (`.txt`/`.pug`) in `sequence/` become full-frame cards.
-   - Use `--label-year` to stamp detected years (from filenames like `20240119-01.jpg`).
+   - Place `.txt`/`.pug` files beside images to create full slides or overlays.
+   - Drop `.mp3` (or `.wav`/`.m4a`) files alongside the matching stem (e.g., `001.jpg` + `001.mp3`). The audio plays from that slide until the next audio file and crossfades over the transition.
+   - Use `--audio-file` to append a global soundtrack instead of (or alongside) timeline cues.
 
 ## Text Slide Format
 
@@ -77,11 +89,72 @@ Utilities for organising a raw photo dump into dated folders, generating a chron
 
 Blank lines add spacing; leading `#` renders as a headline; indented bullets create nested lists.
 
+## Script Reference
+
+### `photo_sorter.py`
+
+```
+python photo_sorter.py [--dry-run] [--source data] [--dest data]
+```
+- Parses EXIF date/captured timestamps and renames/moves recognised files into `dest/YYYY/yyyymmdd-##.ext`.
+- Use `--dry-run` to preview operations.
+
+### `sequence_builder.py`
+
+```
+python sequence_builder.py [--dry-run] [--source data] [--dest sequence]
+```
+- Copies the organised tree (recursively) into a single flattened `sequence/NNN.ext` directory ordered by date/time.
+
+### `convert_heic.py`
+
+```
+python convert_heic.py [--format jpg] [--remove-original] [--dry-run]
+```
+- Converts HEIC/HEIF assets in place (using Pillow/HEIF or ImageMagick fallback) and optionally cleans up originals.
+
+### `extract_audio.py`
+
+```
+python extract_audio.py SOURCE [DURATION]
+                        [--start OFFSET]
+                        [--trim-start TRIM]
+                        [--output OUTPUT]
+                        [--overwrite]
+```
+- Pulls an MP3 clip out of a video file. Omit `DURATION` to export the entire track.
+- `--trim-start` removes leading silence before encoding; combine with `--start` to jump to a position and trim additional padding.
+
+### `sequence_to_video.py`
+
+```
+python sequence_to_video.py [--source-dir sequence]
+                            [--output slideshow.mp4]
+                            [--limit N] [--fps 30]
+                            [--duration D] [--duration-overlay D] [--duration-text D]
+                            [--label-year] [--label-font FONT]
+                            [--debug-filename]
+                            [--chunk-size N] [--chunk-index M] [--batch]
+                            [--audio-file track.mp3 ...]
+                            [--verbose] [--debug-ffmpeg]
+```
+- Builds MP4 segments for images, videos, and text slides, merges them, and (when audio cues exist) writes
+  - `slideshow.mp4` – video-only output
+  - `slideshow_audio.mp3` – timeline soundtrack (with automatic crossfades)
+  - `slideshow_with_audio.mp4` – muxed final video
+- `--limit` is invaluable for quick spot checks.
+- `--keep-temp` retains intermediate `segment_*.mp4` + subtitle PNGs for debugging.
+- `--debug-filename` overlays each slide's original filename in the top-left corner—handy when auditing sequences.
+- Audio cues: add `NNN.mp3` alongside `NNN.jpg` (or `.mp4`). Each cue plays until the next cue and crossfades over the transition.
+- Global mixes: pass `--audio-file background.mp3` to append a traditional soundtrack instead of per-slide cues.
+- Use `--chunk-size 120 --batch` to render every 120-item slice automatically (outputs `slideshow-1.mp4`, `slideshow-2.mp4`, ...). For a single slice, combine `--chunk-size` with `--chunk-index`.
+
 ## Tips
 
-- Keep backups of the original `data/` before bulk moves.
-- Use `--limit N` on `sequence_to_video.py` to experiment before running the full batch.
-- If `--label-year` warns about a missing font, supply one via `--label-font`.
+- Keep backups of `data/` before bulk moves.
+- Use `extract_audio.py` to clean lead-in silence before dropping tracks into `sequence/`.
+- Run `sequence_to_video.py --verbose` for concise `[idx/total]` progress, and `--debug-ffmpeg` when you need the exact command lines.
+- If `--label-year` warns about a missing font, point to a suitable `.ttf`/`.otf` via `--label-font`.
 
 ## License
 

@@ -5,7 +5,7 @@ from typing import Optional
 
 from PIL import ImageFont
 
-from text_renderer import (
+from .text_renderer import (
     BODY_FONT_SIZE,
     BODY_LINE_SPACING,
     INDENT_WIDTH,
@@ -15,7 +15,7 @@ from text_renderer import (
     TOP_LINE_SPACING,
     TOP_MARGIN,
 )
-from text_utils import TextLayout, is_rtl_text
+from .text_utils import TextLayout, is_rtl_text
 
 
 def _escape_ass_text(text: str) -> str:
