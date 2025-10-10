@@ -5,16 +5,7 @@ from typing import Optional
 
 from PIL import ImageFont
 
-from .text_renderer import (
-    BODY_FONT_SIZE,
-    BODY_LINE_SPACING,
-    INDENT_WIDTH,
-    LEFT_MARGIN,
-    RIGHT_MARGIN,
-    TITLE_FONT_SIZE,
-    TOP_LINE_SPACING,
-    TOP_MARGIN,
-)
+from . import text_renderer
 from .text_utils import TextLayout, is_rtl_text
 
 
@@ -62,7 +53,7 @@ def _next_output_path(output_dir: Path, prefix: str, suffix: str) -> Path:
 
 
 def _line_height() -> int:
-    return BODY_FONT_SIZE + BODY_LINE_SPACING
+    return text_renderer.BODY_FONT_SIZE + text_renderer.BODY_LINE_SPACING
 
 
 def create_ass_subtitle(
@@ -116,16 +107,32 @@ def create_ass_subtitle(
 
     if has_title:
         title_direction = "rtl" if is_rtl_text(layout.title) else "ltr"
-        add_dialogue(8, width // 2, TOP_MARGIN, layout.title.strip(), title_direction)
-        top_base_y = TOP_MARGIN + TITLE_FONT_SIZE + TOP_LINE_SPACING
+        add_dialogue(
+            8,
+            width // 2,
+            text_renderer.TOP_MARGIN,
+            layout.title.strip(),
+            title_direction,
+        )
+        top_base_y = (
+            text_renderer.TOP_MARGIN
+            + text_renderer.TITLE_FONT_SIZE
+            + text_renderer.TOP_LINE_SPACING
+        )
     else:
-        top_base_y = TOP_MARGIN
+        top_base_y = text_renderer.TOP_MARGIN
 
     for index, line in enumerate(top_lines):
         y_pos = top_base_y + index * line_height
         line_text = line.text if line.text else line.display
         direction = "rtl" if is_rtl_text(line_text) else "ltr"
-        add_dialogue(9, width - RIGHT_MARGIN, y_pos, line.display.strip(), direction)
+        add_dialogue(
+            9,
+            width - text_renderer.RIGHT_MARGIN,
+            y_pos,
+            line.display.strip(),
+            direction,
+        )
 
     body_start_y = top_base_y + len(top_lines) * line_height
     if has_title or top_lines:
@@ -147,10 +154,12 @@ def create_ass_subtitle(
             x_pos = width // 2
         elif align == "left":
             alignment = 7
-            x_pos = LEFT_MARGIN + line.level * INDENT_WIDTH
+            x_pos = text_renderer.LEFT_MARGIN + line.level * text_renderer.INDENT_WIDTH
         else:  # treat "right" and any fallback as right-aligned
             alignment = 9
-            x_pos = width - RIGHT_MARGIN - line.level * INDENT_WIDTH
+            x_pos = (
+                width - text_renderer.RIGHT_MARGIN - line.level * text_renderer.INDENT_WIDTH
+            )
         add_dialogue(alignment, x_pos, current_y, line.display.strip(), direction)
         current_y += line_height
 
@@ -173,7 +182,7 @@ def create_ass_subtitle(
                 "MarginL, MarginR, MarginV, Encoding"
             ),
             (
-                f"Style: Overlay,{font_name},52,&H00FFFFFF,&H00FFFFFF,&H00000000,&H64000000,"
+                f"Style: Overlay,{font_name},{text_renderer.BODY_FONT_SIZE},&H00FFFFFF,&H00FFFFFF,&H00000000,&H64000000,"
                 "0,0,0,0,100,100,0,0,1,3,0,8,40,120,80,0"
             ),
             "",

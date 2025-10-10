@@ -151,6 +151,7 @@ python sequence_to_video.py [--source-dir sequence]
 - Audio cues: add `NNN.mp3` alongside `NNN.jpg` (or `.mp4`). Each cue plays until the next cue and crossfades over the transition.
 - Global mixes: pass `--audio-file background.mp3` to append a traditional soundtrack instead of per-slide cues.
 - Use `--chunk-size 120 --batch` to render every 120-item slice automatically (outputs `slideshow-1.mp4`, `slideshow-2.mp4`, ...). For a single slice, combine `--chunk-size` with `--chunk-index`.
+- Tweak typography via `title_font_size` / `body_font_size` in `config.json`.
 
 ### `find_duplicates.py`
 

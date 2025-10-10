@@ -31,6 +31,13 @@ def _get_font(font_path: Optional[Path], size: int) -> ImageFont.FreeTypeFont:
         return ImageFont.load_default()
 
 
+def set_font_sizes(title_size: int, body_size: int) -> None:
+    """Update the default font sizes used for titles and body text."""
+    global TITLE_FONT_SIZE, BODY_FONT_SIZE
+    TITLE_FONT_SIZE = max(1, int(title_size))
+    BODY_FONT_SIZE = max(1, int(body_size))
+
+
 def _draw_text(
     draw: ImageDraw.ImageDraw,
     text: str,

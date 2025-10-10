@@ -13,8 +13,7 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Iterable, List, Optional, Sequence, Tuple
 
-from lib.subtitle_renderer import create_ass_subtitle
-from lib.text_renderer import INDENT_WIDTH, LEFT_MARGIN, render_text_panel
+from lib import subtitle_renderer, text_renderer
 from lib.text_utils import TextLayout, combine_overlay_texts, load_text_layout
 
 DEFAULT_CONFIG = {
@@ -25,6 +24,8 @@ DEFAULT_CONFIG = {
     "duration_text": 6.0,
     "fps": 30,
     "resolution": "1920x1080",
+    "title_font_size": 72,
+    "body_font_size": 56,
     "chunk_size": None,
     "chunk_index": 1,
     "debug_filename": False,
@@ -399,6 +400,9 @@ def main() -> None:
         default_font = Path("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf")
         if default_font.exists():
             FONT_PATH = default_font
+    title_font_size = _config_int(config, "title_font_size", DEFAULT_CONFIG["title_font_size"])
+    body_font_size = _config_int(config, "body_font_size", DEFAULT_CONFIG["body_font_size"])
+    text_renderer.set_font_sizes(title_font_size, body_font_size)
     if LABEL_YEAR and FONT_PATH is None:
         print(
             "Warning: --label-year requested but no usable font found. "
@@ -597,7 +601,7 @@ def render_slideshow(
                     args.duration_overlay if overlay_text_value else args.duration_image
                 )
             if overlay_layout and overlay_text_value:
-                overlay_subtitle_path = create_ass_subtitle(
+                overlay_subtitle_path = subtitle_renderer.create_ass_subtitle(
                     overlay_layout,
                     width,
                     height,
@@ -630,7 +634,7 @@ def render_slideshow(
             segment_index += 1
             segment_path = temp_dir_path / f"segment_{segment_index:04d}.mp4"
             text_layout = load_text_layout(media)
-            panel_image = render_text_panel(
+            panel_image = text_renderer.render_text_panel(
                 text_layout,
                 width,
                 height,
@@ -961,12 +965,12 @@ def build_text_filter_graph(
         f"fontfile='{escape_drawtext(FONT_PATH.as_posix())}':" if FONT_PATH else ""
     )
 
-    title_font_size = 72
-    body_font_size = 56
-    body_spacing = 22
-    indent_px = INDENT_WIDTH
-    margin_right = 120
-    margin_left = LEFT_MARGIN
+    title_font_size = text_renderer.TITLE_FONT_SIZE
+    body_font_size = text_renderer.BODY_FONT_SIZE
+    body_spacing = text_renderer.BODY_LINE_SPACING
+    indent_px = text_renderer.INDENT_WIDTH
+    margin_right = text_renderer.RIGHT_MARGIN
+    margin_left = text_renderer.LEFT_MARGIN
 
     if layout.title:
         title_text = layout.title.strip()
@@ -975,7 +979,7 @@ def build_text_filter_graph(
         steps.append(
             f"[{current}]drawtext={font_clause}text='{title_value}':fontsize={title_font_size}:"
             "fontcolor=white:borderw=3:bordercolor=black:text_shaping=1:"
-            "x=(w-text_w)/2:y=80"
+            f"x=(w-text_w)/2:y={text_renderer.TOP_MARGIN}"
             f"[{title_label}]"
         )
         current = title_label
@@ -983,7 +987,13 @@ def build_text_filter_graph(
     body_lines = [line for line in layout.lines if line.kind not in {"blank", "top"} and line.display.strip()]
     line_height = body_font_size + body_spacing
     top_lines = [line for line in layout.lines if line.kind == "top" and line.display.strip()]
-    top_base_y = 140
+    top_base_y = (
+        text_renderer.TOP_MARGIN
+        + text_renderer.TITLE_FONT_SIZE
+        + text_renderer.TOP_LINE_SPACING
+        if layout.title
+        else text_renderer.TOP_MARGIN + 60
+    )
     top_index = 0
 
     if layout.title:
@@ -997,7 +1007,7 @@ def build_text_filter_graph(
         current_y = base_body_y
 
     if not body_lines and not top_lines and not layout.title:
-        current_y = max((height - line_height) // 2, 120)
+        current_y = max((height - line_height) // 2, text_renderer.TOP_MARGIN + 40)
 
     for line in layout.lines:
         if line.kind == "blank":
@@ -1014,7 +1024,7 @@ def build_text_filter_graph(
             y_expr = str(current_y)
             current_y += line_height
         elif line.align == "top":
-            x_expr = "w-text_w-120"
+            x_expr = f"w-text_w-{margin_right}"
             y_expr = str(top_base_y + top_index * line_height)
             top_index += 1
         elif line.align == "left":

@@ -27,6 +27,7 @@ except ImportError:  # pragma: no cover - optional dependency
     watchfiles_watch = None
 
 import sequence_to_video as stv
+from lib import text_renderer
 from lib.subtitle_renderer import create_ass_subtitle
 from lib.text_utils import TextLayout, combine_overlay_texts, load_text_layout
 
@@ -567,6 +568,10 @@ def run_build(args: argparse.Namespace, announce_audio: bool = True) -> Set[Path
         default_font = Path("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf")
         if default_font.exists():
             stv.FONT_PATH = default_font
+
+    title_font_size = int(config.get("title_font_size", stv.DEFAULT_CONFIG["title_font_size"]))
+    body_font_size = int(config.get("body_font_size", stv.DEFAULT_CONFIG["body_font_size"]))
+    text_renderer.set_font_sizes(title_font_size, body_font_size)
 
     source_dir = Path(config.get("source_dir", stv.DEFAULT_CONFIG["source_dir"])).resolve()
     if not source_dir.exists():
