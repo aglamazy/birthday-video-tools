@@ -87,6 +87,7 @@ def create_ass_subtitle(
         y_pos: int,
         text: str,
         direction: Optional[str] = None,
+        font_size: Optional[int] = None,
     ) -> None:
         if not text:
             return
@@ -96,6 +97,8 @@ def create_ass_subtitle(
             overrides.append("\\rtl")
         elif direction == "ltr":
             overrides.append("\\ltr")
+        if font_size:
+            overrides.append(f"\\fs{font_size}")
         override_block = "".join(overrides)
         dialogues.append(
             f"Dialogue: 0,0:00:00.00,{end_time},Overlay,,0,0,0,,"
@@ -113,6 +116,7 @@ def create_ass_subtitle(
             text_renderer.TOP_MARGIN,
             layout.title.strip(),
             title_direction,
+            text_renderer.TITLE_FONT_SIZE,
         )
         top_base_y = (
             text_renderer.TOP_MARGIN
@@ -132,6 +136,7 @@ def create_ass_subtitle(
             y_pos,
             line.display.strip(),
             direction,
+            text_renderer.BODY_FONT_SIZE,
         )
 
     body_start_y = top_base_y + len(top_lines) * line_height
@@ -160,7 +165,14 @@ def create_ass_subtitle(
             x_pos = (
                 width - text_renderer.RIGHT_MARGIN - line.level * text_renderer.INDENT_WIDTH
             )
-        add_dialogue(alignment, x_pos, current_y, line.display.strip(), direction)
+        add_dialogue(
+            alignment,
+            x_pos,
+            current_y,
+            line.display.strip(),
+            direction,
+            text_renderer.BODY_FONT_SIZE,
+        )
         current_y += line_height
 
     if not dialogues:

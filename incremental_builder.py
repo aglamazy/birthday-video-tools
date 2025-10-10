@@ -569,9 +569,25 @@ def run_build(args: argparse.Namespace, announce_audio: bool = True) -> Set[Path
         if default_font.exists():
             stv.FONT_PATH = default_font
 
-    title_font_size = int(config.get("title_font_size", stv.DEFAULT_CONFIG["title_font_size"]))
-    body_font_size = int(config.get("body_font_size", stv.DEFAULT_CONFIG["body_font_size"]))
+    def _font_size(value, fallback):
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return fallback
+
+    title_font_size = _font_size(
+        config.get("title_font_size"), stv.DEFAULT_CONFIG["title_font_size"]
+    )
+    body_font_size = _font_size(
+        config.get("body_font_size"), stv.DEFAULT_CONFIG["body_font_size"]
+    )
     text_renderer.set_font_sizes(title_font_size, body_font_size)
+
+    def _font_size(value, fallback):
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return fallback
 
     source_dir = Path(config.get("source_dir", stv.DEFAULT_CONFIG["source_dir"])).resolve()
     if not source_dir.exists():
@@ -646,27 +662,35 @@ def run_build(args: argparse.Namespace, announce_audio: bool = True) -> Set[Path
             pass
 
     final_output = next_versioned_path(base_output)
-    if args.verbose:
-        print(f"concatenating into {final_output.name}")
-    concat_segments(plan, final_output, segments_dir, ffmpeg_path)
-    print(f"generated {final_output.name}")
-
-    audio_paths = [Path(entry) for entry in config.get("audio_files", []) if entry]
-    for audio in audio_paths:
-        resolved_audio = audio.resolve()
-        watch_paths.add(resolved_audio)
-        watch_paths.add(resolved_audio.parent)
-    if audio_paths:
-        resolved, missing = stv.resolve_audio_files(audio_paths)
-        for missing_path in missing:
-            print(f"Warning: audio file {missing_path} not found; skipping.")
-        if resolved:
-            if announce_audio and args.verbose:
-                resolved_list = ", ".join(path.as_posix() for path in resolved)
-                print(f"using audio tracks: {resolved_list}")
-            attach_audio_tracks(ffmpeg_path, final_output, resolved)
-            watch_paths.update(path.resolve() for path in resolved)
-            watch_paths.update(path.resolve().parent for path in resolved)
+    build_succeeded = False
+    try:
+        if args.verbose:
+            print(f"concatenating into {final_output.name}")
+        concat_segments(plan, final_output, segments_dir, ffmpeg_path)
+        audio_paths = [Path(entry) for entry in config.get("audio_files", []) if entry]
+        for audio in audio_paths:
+            resolved_audio = audio.resolve()
+            watch_paths.add(resolved_audio)
+            watch_paths.add(resolved_audio.parent)
+        if audio_paths:
+            resolved, missing = stv.resolve_audio_files(audio_paths)
+            for missing_path in missing:
+                print(f"Warning: audio file {missing_path} not found; skipping.")
+            if resolved:
+                if announce_audio and args.verbose:
+                    resolved_list = ", ".join(path.as_posix() for path in resolved)
+                    print(f"using audio tracks: {resolved_list}")
+                attach_audio_tracks(ffmpeg_path, final_output, resolved)
+                watch_paths.update(path.resolve() for path in resolved)
+                watch_paths.update(path.resolve().parent for path in resolved)
+        print(f"generated {final_output.name}")
+        build_succeeded = True
+    finally:
+        if not build_succeeded and final_output.exists():
+            try:
+                final_output.unlink()
+            except OSError:
+                pass
 
     return watch_paths
 

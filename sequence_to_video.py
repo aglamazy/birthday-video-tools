@@ -403,6 +403,9 @@ def main() -> None:
     title_font_size = _config_int(config, "title_font_size", DEFAULT_CONFIG["title_font_size"])
     body_font_size = _config_int(config, "body_font_size", DEFAULT_CONFIG["body_font_size"])
     text_renderer.set_font_sizes(title_font_size, body_font_size)
+    title_font_size = _config_int(config, "title_font_size", DEFAULT_CONFIG["title_font_size"])
+    body_font_size = _config_int(config, "body_font_size", DEFAULT_CONFIG["body_font_size"])
+    text_renderer.set_font_sizes(title_font_size, body_font_size)
     if LABEL_YEAR and FONT_PATH is None:
         print(
             "Warning: --label-year requested but no usable font found. "
@@ -900,6 +903,11 @@ def build_media_filter_graph(
         steps.append(f"[{current}]{filter_expr}[{next_out}]")
         current = next_out
 
+    body_font_size = text_renderer.BODY_FONT_SIZE
+    title_font_size = text_renderer.TITLE_FONT_SIZE
+    label_font_size = max(24, int(body_font_size * 0.9))
+    debug_font_size = max(18, int(body_font_size * 0.6))
+
     if overlay_subtitle:
         subtitle_path = escape_subtitle_path(overlay_subtitle)
         subtitle_filter = f"subtitles='{subtitle_path}'"
@@ -913,8 +921,8 @@ def build_media_filter_graph(
         )
         overlay_value = escape_drawtext(overlay_text)
         append_filter(
-            f"drawtext={overlay_font_clause}text='{overlay_value}':fontsize=52:"
-            "line_spacing=16:fontcolor=white:borderw=3:bordercolor=black:text_shaping=1:"
+            f"drawtext={overlay_font_clause}text='{overlay_value}':fontsize={body_font_size}:"
+            "line_spacing=18:fontcolor=white:borderw=3:bordercolor=black:text_shaping=1:"
             "x=(w-text_w)/2:y=(h-text_h)/2"
         )
 
@@ -924,7 +932,7 @@ def build_media_filter_graph(
         )
         label_value = escape_drawtext(label_text)
         append_filter(
-            f"drawtext={font_clause}text='{label_value}':fontsize=48:fontcolor=white:"
+            f"drawtext={font_clause}text='{label_value}':fontsize={label_font_size}:fontcolor=white:"
             "box=1:boxcolor=0x00000088:text_shaping=1:x=w-tw-40:y=h-th-40"
         )
 
@@ -934,7 +942,7 @@ def build_media_filter_graph(
         )
         debug_value = escape_drawtext(debug_text)
         append_filter(
-            f"drawtext={debug_font_clause}text='{debug_value}':fontsize=32:"
+            f"drawtext={debug_font_clause}text='{debug_value}':fontsize={debug_font_size}:"
             "fontcolor=white:borderw=2:bordercolor=black:text_shaping=1:"
             "x=40:y=40"
         )
