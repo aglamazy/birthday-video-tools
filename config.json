@@ -9,9 +9,16 @@
   "chunk_size": null,
   "chunk_index": null,
   "debug_filename": false,
-  "audio_files": [],
+  "audio_files": [
+    "audio/selected/0.mp3",
+    "audio/selected/1.mp3",
+    "audio/selected/2.mp3"
+  ],
   "transitions": {
     "enabled": false,
-    "allowed": []
+    "allowed": [
+      "slide_left"
+    ],
+    "duration": 1.0
   }
 }

@@ -170,3 +170,27 @@ python find_duplicates.py [root] [--follow-links] [--min-size BYTES] [--deep] [-
 ## License
 
 MIT (see `LICENSE` if provided).
+- Walks the directory (default `sequence/`), hashes each file, and prints groups with identical byte signatures.
+- `--min-size` helps skip thumbnails; `--follow-links` inspects symlinked trees; adding `--deep` computes a perceptual hash to flag visually similar images within the chosen Hamming threshold (`--hamming`, default 5).
+
+### `incremental_builder.py`
+
+```
+python incremental_builder.py [--segments-dir segments]
+                              [--output slideshow.mp4]
+                              [--limit N] [--verbose] [--force]
+                              [--watch] [--interval 1.0]
+```
+- Renders each slide into `segments/segment_XXXX.mp4`, reusing cached segments when sources are unchanged.
+- After updating the necessary segments, emits a versioned MP4 (e.g., `slideshow-001.mp4`) and attaches any audio tracks listed in `config.json`.
+- Use `--force` to rebuild everything, or simply edit media/text files and rerun for incremental updates.
+- Add `--watch` to keep rebuilding automatically when `sequence/`, `config.json`, or configured audio tracks change (requires the `watchfiles` package for event-driven mode; falls back to polling otherwise).
+  - Install with `python -m pip install watchfiles` (optional).
+
+### `watch_incremental.py`
+
+```
+python watch_incremental.py [--interval 1.0] [--sequence-dir sequence] -- [builder args]
+```
+- Polls `sequence/` for changes and reruns `incremental_builder.py` with the provided arguments whenever files change (useful if you prefer to keep the watcher separate or don’t have `watchfiles` installed).
+- Example: `python watch_incremental.py -- --limit 20 --verbose`.

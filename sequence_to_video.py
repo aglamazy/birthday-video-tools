@@ -418,6 +418,9 @@ def main() -> None:
     resolved_audio_paths, missing_audio_paths = resolve_audio_files(audio_candidates)
     for missing_audio in missing_audio_paths:
         print(f"Warning: audio file {missing_audio} not found; skipping.")
+    if resolved_audio_paths:
+        audio_list = ", ".join(path.as_posix() for path in resolved_audio_paths)
+        print(f"Using audio tracks: {audio_list}")
 
     ffmpeg_path = shutil.which("ffmpeg")
     if not ffmpeg_path:
