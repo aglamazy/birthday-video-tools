@@ -16,6 +16,7 @@ import re
 import shutil
 import subprocess
 import time
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Sequence, Set
@@ -385,6 +386,96 @@ def concat_segments(
     stv.run_ffmpeg(cmd)
 
 
+def attach_audio_tracks(
+    ffmpeg_path: str,
+    video_path: Path,
+    audio_paths: Sequence[Path],
+) -> None:
+    existing_sources = [path for path in audio_paths if path.exists()]
+    if not existing_sources:
+        return
+
+    with tempfile.TemporaryDirectory() as tmp_dir_str:
+        tmp_dir = Path(tmp_dir_str)
+        combined_audio = tmp_dir / "combined_audio.m4a"
+
+        if len(existing_sources) == 1:
+            stv.run_ffmpeg(
+                [
+                    ffmpeg_path,
+                    "-hide_banner",
+                    "-loglevel",
+                    "error",
+                    "-y",
+                    "-i",
+                    str(existing_sources[0]),
+                    "-c:a",
+                    "aac",
+                    "-ac",
+                    "2",
+                    "-ar",
+                    "48000",
+                    str(combined_audio),
+                ]
+            )
+        else:
+            concat_cmd: List[str] = [
+                ffmpeg_path,
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-y",
+            ]
+            for source in existing_sources:
+                concat_cmd.extend(["-i", str(source)])
+            filter_inputs = "".join(f"[{idx}:a]" for idx in range(len(existing_sources)))
+            filter_complex = (
+                f"{filter_inputs}concat=n={len(existing_sources)}:v=0:a=1[aout]"
+            )
+            concat_cmd.extend(
+                [
+                    "-filter_complex",
+                    filter_complex,
+                    "-map",
+                    "[aout]",
+                    "-c:a",
+                    "aac",
+                    "-ac",
+                    "2",
+                    "-ar",
+                    "48000",
+                    str(combined_audio),
+                ]
+            )
+            stv.run_ffmpeg(concat_cmd)
+
+        tmp_video = tmp_dir / "with_audio.mp4"
+        stv.run_ffmpeg(
+            [
+                ffmpeg_path,
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-y",
+                "-i",
+                str(video_path),
+                "-i",
+                str(combined_audio),
+                "-map",
+                "0:v:0",
+                "-map",
+                "1:a:0",
+                "-c:v",
+                "copy",
+                "-c:a",
+                "aac",
+                "-shortest",
+                str(tmp_video),
+            ]
+        )
+        shutil.move(tmp_video, video_path)
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -448,12 +539,23 @@ def collect_snapshot(paths: Iterable[Path]) -> Dict[Path, float]:
     return snapshot
 
 
-def run_build(args: argparse.Namespace) -> Set[Path]:
+def diff_snapshot(old: Dict[Path, float], new: Dict[Path, float]) -> List[Path]:
+    changed: set[Path] = set()
+    for path, mtime in new.items():
+        if old.get(path) != mtime:
+            changed.add(path)
+    for path in old:
+        if path not in new:
+            changed.add(path)
+    return sorted(changed)
+
+
+def run_build(args: argparse.Namespace, announce_audio: bool = True) -> Set[Path]:
     config = load_config(args.config)
 
-    stv.VERBOSE = args.verbose
-    stv.FFMPEG_DEBUG = args.verbose
-    stv.SHOW_FILENAME = args.debug_filename
+    stv.VERBOSE = False
+    stv.FFMPEG_DEBUG = False
+    stv.SHOW_FILENAME = args.debug_filename or bool(config.get("debug_filename", False))
     stv.LABEL_YEAR = bool(config.get("label_year", False))
 
     label_font = config.get("label_font")
@@ -512,11 +614,19 @@ def run_build(args: argparse.Namespace) -> Set[Path]:
     ffmpeg_path = shutil.which("ffmpeg") or "ffmpeg"
 
     for segment in plan:
-        watch_paths.update(dep.resolve() for dep in list_dependencies(segment))
+        watch_paths.add(segment.source.resolve())
+        for dep in segment.overlay_sources:
+            watch_paths.add(dep.resolve())
         output_segment = segments_dir / f"segment_{segment.index:04d}.mp4"
         deps = list_dependencies(segment)
         if args.force or needs_render(output_segment, deps, additional_mtime):
-            print(f"[segment {segment.index}] Rendering {segment.source.name}")
+            if args.verbose:
+                extras = (
+                    " + " + ", ".join(src.name for src in segment.overlay_sources)
+                    if segment.overlay_sources
+                    else ""
+                )
+                print(f"processing {segment.source.name}{extras}")
             render_segment(
                 segment,
                 output_segment,
@@ -528,12 +638,13 @@ def run_build(args: argparse.Namespace) -> Set[Path]:
                 duration_image,
             )
         elif args.verbose:
-            print(f"[segment {segment.index}] Up to date ({output_segment.name})")
+            pass
 
     final_output = next_versioned_path(base_output)
-    print(f"Concatenating segments into {final_output.name}...")
+    if args.verbose:
+        print(f"concatenating into {final_output.name}")
     concat_segments(plan, final_output, segments_dir, ffmpeg_path)
-    print(f"Wrote {final_output}")
+    print(f"generated {final_output.name}")
 
     audio_paths = [Path(entry) for entry in config.get("audio_files", []) if entry]
     for audio in audio_paths:
@@ -545,9 +656,10 @@ def run_build(args: argparse.Namespace) -> Set[Path]:
         for missing_path in missing:
             print(f"Warning: audio file {missing_path} not found; skipping.")
         if resolved:
-            resolved_list = ", ".join(path.as_posix() for path in resolved)
-            print(f"Using audio tracks: {resolved_list}")
-            stv.apply_audio_track(ffmpeg_path, final_output, resolved)
+            if announce_audio and args.verbose:
+                resolved_list = ", ".join(path.as_posix() for path in resolved)
+                print(f"using audio tracks: {resolved_list}")
+            attach_audio_tracks(ffmpeg_path, final_output, resolved)
             watch_paths.update(path.resolve() for path in resolved)
             watch_paths.update(path.resolve().parent for path in resolved)
 
@@ -555,22 +667,46 @@ def run_build(args: argparse.Namespace) -> Set[Path]:
 
 
 def watch_loop(args: argparse.Namespace) -> None:
+    initial_config = load_config(args.config)
+    audio_entries = [Path(entry) for entry in initial_config.get("audio_files", []) if entry]
+    if audio_entries:
+        resolved, _ = stv.resolve_audio_files(audio_entries)
+        if resolved:
+            resolved_list = ", ".join(path.as_posix() for path in resolved)
+            print(f"using audio tracks: {resolved_list}")
+
     print("Watching for changes... Press Ctrl+C to stop.")
+    snapshot: Dict[Path, float] = {}
+    watch_paths: Set[Path] = set()
     try:
         while True:
-            watch_paths = run_build(args)
-            paths_str = [str(path) for path in watch_paths]
+            baseline = collect_snapshot(watch_paths) if watch_paths else snapshot
+            watch_paths = run_build(args, announce_audio=False)
+            current_snapshot = collect_snapshot(watch_paths)
+            if baseline and current_snapshot != baseline:
+                changed_paths = diff_snapshot(baseline, current_snapshot)
+                if changed_paths:
+                    names = ", ".join(sorted(path.name for path in changed_paths))
+                    print(f"detected change in {names}")
+                snapshot = current_snapshot
+                continue
+            snapshot = current_snapshot
+            watch_dirs = {path if path.is_dir() else path.parent for path in watch_paths}
             if watchfiles_watch is not None:
-                for _changes in watchfiles_watch(*paths_str):
-                    print("Change detected; rebuilding...")
+                for changes in watchfiles_watch(*{str(path) for path in watch_dirs}):
+                    changed_paths = sorted({Path(p) for _change, p in changes})
+                    names = ", ".join(path.name for path in changed_paths) if changed_paths else "files"
+                    print(f"detected change in {names}")
                     break
             else:
-                snapshot = collect_snapshot(watch_paths)
                 while True:
                     time.sleep(max(args.interval, 0.1))
                     current = collect_snapshot(watch_paths)
                     if current != snapshot:
-                        print("Change detected; rebuilding...")
+                        changed_paths = diff_snapshot(snapshot, current)
+                        names = ", ".join(path.name for path in changed_paths) if changed_paths else "files"
+                        print(f"detected change in {names}")
+                        snapshot = current
                         break
     except KeyboardInterrupt:
         print("\nStopped watching.")
