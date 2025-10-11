@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import copy
 import json
 import re
 import shutil
@@ -13,7 +14,8 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Iterable, List, Optional, Sequence, Tuple
 
-from lib import subtitle_renderer, text_renderer
+from lib import collage, subtitle_renderer, text_renderer
+from lib.motion import EFFECT_SEQUENCE, MotionPlan, build_motion_filter, select_motion
 from lib.text_utils import TextLayout, combine_overlay_texts, load_text_layout
 
 DEFAULT_CONFIG = {
@@ -30,6 +32,11 @@ DEFAULT_CONFIG = {
     "chunk_index": 1,
     "debug_filename": False,
     "audio_files": [],
+    "transitions": {
+        "enabled": False,
+        "motions": list(EFFECT_SEQUENCE),
+        "duration": 1.0,
+    },
 }
 
 CONFIG_PATH = Path(__file__).resolve().parent / "config.json"
@@ -45,8 +52,10 @@ FONT_PATH: Optional[Path] = None
 SHOW_FILENAME = False
 FFMPEG_DEBUG = False
 CROSSFADE_SECONDS = 1.0
+MOTION_ENABLED = False
+MOTION_EFFECTS: List[str] = []
 def load_config(path: Path) -> dict[str, object]:
-    config = DEFAULT_CONFIG.copy()
+    config = copy.deepcopy(DEFAULT_CONFIG)
     if not path.exists():
         return config
     try:
@@ -58,10 +67,52 @@ def load_config(path: Path) -> dict[str, object]:
     if not isinstance(data, dict):
         print(f"Warning: config {path} is not a JSON object; using defaults")
         return config
-    for key in config:
-        if key in data:
-            config[key] = data[key]
+    for key, value in data.items():
+        if key == "transitions" and isinstance(value, dict):
+            merged = copy.deepcopy(DEFAULT_CONFIG.get("transitions", {}))
+            for sub_key, sub_value in value.items():
+                merged[sub_key] = sub_value
+            config["transitions"] = merged
+        elif key in config:
+            config[key] = value
     return config
+
+
+def configure_motion(config: dict[str, object]) -> None:
+    global MOTION_ENABLED, MOTION_EFFECTS
+    transitions_cfg = config.get("transitions")
+    if not isinstance(transitions_cfg, dict):
+        MOTION_ENABLED = False
+        MOTION_EFFECTS = []
+        return
+
+    enabled = bool(transitions_cfg.get("enabled", False))
+    motions_value = transitions_cfg.get("motions")
+    if motions_value is None:
+        motions_value = transitions_cfg.get("allowed")
+
+    effects: list[str] = []
+    if isinstance(motions_value, list):
+        for item in motions_value:
+            if isinstance(item, str):
+                name = item.strip()
+                if name:
+                    effects.append(name)
+
+    sanitized = [effect for effect in effects if effect in EFFECT_SEQUENCE]
+    if not sanitized:
+        MOTION_ENABLED = False
+        MOTION_EFFECTS = []
+        return
+
+    MOTION_ENABLED = enabled
+    MOTION_EFFECTS = sanitized if enabled else []
+
+
+def get_motion_plan(index: int, duration: float, fps: int) -> Optional[MotionPlan]:
+    if not MOTION_ENABLED or not MOTION_EFFECTS:
+        return None
+    return select_motion(index, duration, fps, MOTION_EFFECTS)
 
 
 def _config_float(config: dict[str, object], key: str, fallback: float) -> float:
@@ -168,6 +219,12 @@ def build_batch_output_path(base: Path, chunk_index: int) -> Path:
     return base.with_name(f"{stem}-{chunk_index}{suffix}")
 
 
+def ensure_mp4_suffix(path: Path) -> Path:
+    if path.suffix:
+        return path
+    return path.with_suffix(".mp4")
+
+
 @dataclass(frozen=True)
 class Segment:
     source: Path
@@ -182,6 +239,7 @@ class Segment:
     panel_image: Optional[Path] = None
     overlay_subtitle: Optional[Path] = None
     expected_duration: Optional[float] = None
+    visual_sources: tuple[Path, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -385,12 +443,14 @@ def parse_args(config: dict[str, object]) -> argparse.Namespace:
 
 def main() -> None:
     config = load_config(CONFIG_PATH)
+    configure_motion(config)
     args = parse_args(config)
     if args.debug_ffmpeg:
         args.verbose = True
     global VERBOSE, FFMPEG_DEBUG
     VERBOSE = args.verbose
     FFMPEG_DEBUG = args.debug_ffmpeg
+    args.output = ensure_mp4_suffix(args.output)
     global LABEL_YEAR, FONT_PATH, SHOW_FILENAME
     LABEL_YEAR = args.label_year
     SHOW_FILENAME = args.debug_filename
@@ -484,6 +544,7 @@ def main() -> None:
                 width,
                 height,
                 output_path,
+                source_dir,
                 audio_paths=resolved_audio_paths,
             )
         return
@@ -526,6 +587,8 @@ def main() -> None:
         print("No media files found in source directory.")
         return
 
+    args.output = ensure_mp4_suffix(args.output)
+
     render_slideshow(
         selected_media,
         args,
@@ -534,6 +597,7 @@ def main() -> None:
         width,
         height,
         args.output,
+        source_dir,
         audio_paths=resolved_audio_paths,
     )
 
@@ -546,6 +610,7 @@ def render_slideshow(
     width: int,
     height: int,
     output_path: Path,
+    source_dir: Path,
     audio_paths: Optional[Sequence[Path]] = None,
 ) -> None:
     media_files = list(media_files)
@@ -554,21 +619,18 @@ def render_slideshow(
 
     resolved_audio_paths = list(audio_paths or [])
 
-    media_stems_with_visual = {
-        path.stem
-        for path in media_files
-        if path.suffix.lower() in IMAGE_EXTENSIONS or path.suffix.lower() in VIDEO_EXTENSIONS
-    }
-
-    # Pair auxiliary text files with matching media for overlays.
-    overlay_text_map: dict[str, list[Path]] = {}
-    # Track texts already consumed as overlays so they are not treated as slides.
-    overlay_text_paths: set[Path] = set()
+    prefix_order: List[str] = []
+    seen_prefixes: set[str] = set()
+    pending_audio: List[tuple[str, Path]] = []
     for path in media_files:
         suffix = path.suffix.lower()
-        if suffix in TEXT_EXTENSIONS and path.stem in media_stems_with_visual:
-            overlay_text_map.setdefault(path.stem, []).append(path)
-            overlay_text_paths.add(path)
+        prefix = path.stem.split("_", 1)[0]
+        if suffix in AUDIO_EXTENSIONS:
+            pending_audio.append((prefix, path))
+            continue
+        if prefix not in seen_prefixes:
+            prefix_order.append(prefix)
+            seen_prefixes.add(prefix)
 
     segments: List[Segment] = []
     audio_markers: list[AudioMarker] = []
@@ -581,28 +643,33 @@ def render_slideshow(
 
     text_panel_temp_dir = temp_dir_path / "text_panels"
     subtitle_temp_dir = temp_dir_path / "subtitles"
+    collage_root = temp_dir_path / "collages"
+    collage_root.mkdir(parents=True, exist_ok=True)
 
     segment_index = 0
-    segment_index_by_stem: dict[str, int] = {}
-    for media in media_files:
-        suffix = media.suffix.lower()
-        if suffix in IMAGE_EXTENSIONS or suffix in VIDEO_EXTENSIONS:
+    segment_index_by_prefix: dict[str, int] = {}
+
+    for prefix in prefix_order:
+        visuals, overlays = collage.collect_assets(source_dir, prefix)
+        image_files = [path for path in visuals if path.suffix.lower() in IMAGE_EXTENSIONS]
+        video_files = [path for path in visuals if path.suffix.lower() in VIDEO_EXTENSIONS]
+
+        overlay_layout: Optional[TextLayout] = None
+        overlay_text_value: Optional[str] = None
+        overlay_subtitle_path: Optional[Path] = None
+        if overlays:
+            combined_layout = combine_overlay_texts(overlays)
+            if combined_layout.lines or combined_layout.title:
+                overlay_layout = combined_layout
+                overlay_text_value = combined_layout.overlay_text()
+                if not overlay_text_value:
+                    overlay_text_value = None
+
+        if image_files:
+            primary_source = image_files[0]
             segment_index += 1
             segment_path = temp_dir_path / f"segment_{segment_index:04d}.mp4"
-            overlay_sources = overlay_text_map.get(media.stem, [])
-            overlay_text_value: Optional[str] = None
-            overlay_layout: Optional[TextLayout] = None
-            overlay_subtitle_path: Optional[Path] = None
-            if overlay_sources:
-                combined_layout = combine_overlay_texts(overlay_sources)
-                if combined_layout.lines or combined_layout.title:
-                    overlay_layout = combined_layout
-                    overlay_text_value = combined_layout.overlay_text()
-            duration_value: Optional[float] = None
-            if suffix in IMAGE_EXTENSIONS:
-                duration_value = (
-                    args.duration_overlay if overlay_text_value else args.duration_image
-                )
+            duration_value = args.duration_overlay if overlay_text_value else args.duration_image
             if overlay_layout and overlay_text_value:
                 overlay_subtitle_path = subtitle_renderer.create_ass_subtitle(
                     overlay_layout,
@@ -612,31 +679,60 @@ def render_slideshow(
                     subtitle_temp_dir,
                     duration_value,
                 )
-            if suffix in IMAGE_EXTENSIONS:
-                expected_duration = duration_value or args.duration_image
-            else:
-                expected_duration = probe_media_duration(ffprobe_path, media)
             segments.append(
                 Segment(
-                    source=media,
+                    source=primary_source,
                     output=segment_path,
-                    kind="image" if suffix in IMAGE_EXTENSIONS else "video",
-                    label=infer_year_text(media),
+                    kind="image",
+                    label=infer_year_text(primary_source),
                     overlay_text=overlay_text_value,
-                    overlay_sources=tuple(overlay_sources),
+                    overlay_sources=tuple(overlays),
                     duration=duration_value,
                     overlay_layout=overlay_layout,
                     overlay_subtitle=overlay_subtitle_path,
-                    expected_duration=expected_duration,
+                    expected_duration=duration_value,
+                    visual_sources=tuple(image_files),
                 )
             )
-            segment_index_by_stem[media.stem] = len(segments) - 1
-        elif suffix in TEXT_EXTENSIONS:
-            if media in overlay_text_paths:
-                continue
+            segment_index_by_prefix[prefix] = len(segments) - 1
+            continue
+
+        if video_files:
+            primary_video = video_files[0]
             segment_index += 1
             segment_path = temp_dir_path / f"segment_{segment_index:04d}.mp4"
-            text_layout = load_text_layout(media)
+            if overlay_layout and overlay_text_value:
+                overlay_subtitle_path = subtitle_renderer.create_ass_subtitle(
+                    overlay_layout,
+                    width,
+                    height,
+                    FONT_PATH,
+                    subtitle_temp_dir,
+                    None,
+                )
+            expected_duration = probe_media_duration(ffprobe_path, primary_video)
+            segments.append(
+                Segment(
+                    source=primary_video,
+                    output=segment_path,
+                    kind="video",
+                    label=infer_year_text(primary_video),
+                    overlay_text=overlay_text_value,
+                    overlay_sources=tuple(overlays),
+                    duration=None,
+                    overlay_layout=overlay_layout,
+                    overlay_subtitle=overlay_subtitle_path,
+                    expected_duration=expected_duration,
+                    visual_sources=tuple(video_files),
+                )
+            )
+            segment_index_by_prefix[prefix] = len(segments) - 1
+            continue
+
+        if overlays:
+            segment_index += 1
+            segment_path = temp_dir_path / f"segment_{segment_index:04d}.mp4"
+            text_layout = overlay_layout if overlay_layout else combine_overlay_texts(overlays)
             panel_image = text_renderer.render_text_panel(
                 text_layout,
                 width,
@@ -647,7 +743,7 @@ def render_slideshow(
             )
             segments.append(
                 Segment(
-                    source=media,
+                    source=overlays[0],
                     output=segment_path,
                     kind="text",
                     text_layout=text_layout,
@@ -656,13 +752,12 @@ def render_slideshow(
                     expected_duration=args.duration_text,
                 )
             )
-            segment_index_by_stem[media.stem] = len(segments) - 1
-        elif suffix in AUDIO_EXTENSIONS:
-            target_index = segment_index_by_stem.get(media.stem, len(segments))
-            audio_markers.append(AudioMarker(path=media, segment_index=target_index))
+            segment_index_by_prefix[prefix] = len(segments) - 1
             continue
-        else:
-            print(f"Skipping unsupported file {media.name}")
+
+    for audio_prefix, audio_path in pending_audio:
+        target_index = segment_index_by_prefix.get(audio_prefix, len(segments))
+        audio_markers.append(AudioMarker(path=audio_path, segment_index=target_index))
 
     if not segments:
         print("No convertible media files found.")
@@ -684,6 +779,8 @@ def render_slideshow(
             extra: List[str] = []
             if label:
                 extra.append(f"label {label}")
+            if segment.kind == "image" and len(segment.visual_sources) > 1:
+                extra.append("collage")
             if segment.overlay_text:
                 overlay_names = (
                     ", ".join(src.name for src in segment.overlay_sources)
@@ -706,7 +803,26 @@ def render_slideshow(
             )
             debug_text = segment.source.name if SHOW_FILENAME else None
             if segment.kind == "image":
+                visuals = list(segment.visual_sources) if segment.visual_sources else []
+                source_input: Path
+                if visuals:
+                    source_input = visuals[0]
+                else:
+                    source_input = segment.source
+                if len(visuals) > 1:
+                    workspace = collage_root / f"collage_{idx:04d}"
+                    workspace.mkdir(parents=True, exist_ok=True)
+                    source_input = collage.build_collage(
+                        ffmpeg_path,
+                        ffprobe_path,
+                        visuals,
+                        width,
+                        height,
+                        workspace,
+                    )
+
                 still_duration = segment.duration or args.duration_image
+                motion_plan = get_motion_plan(idx, still_duration, args.fps)
                 filter_graph, filter_output = build_media_filter_graph(
                     width,
                     height,
@@ -714,6 +830,7 @@ def render_slideshow(
                     label,
                     debug_text,
                     segment.overlay_subtitle,
+                    motion_plan,
                 )
                 run_ffmpeg(
                     [
@@ -729,7 +846,7 @@ def render_slideshow(
                         "-t",
                         f"{still_duration}",
                         "-i",
-                        str(segment.source),
+                        str(source_input),
                         "-f",
                         "lavfi",
                         "-t",
@@ -766,6 +883,7 @@ def render_slideshow(
                     label,
                     debug_text,
                     segment.overlay_subtitle,
+                    None,
                 )
                 run_ffmpeg(
                     [
@@ -879,6 +997,7 @@ def build_media_filter_graph(
     label_text: Optional[str],
     debug_text: Optional[str],
     overlay_subtitle: Optional[Path] = None,
+    motion: Optional[MotionPlan] = None,
 ) -> tuple[str, str]:
     label_counter = 0
 
@@ -902,6 +1021,11 @@ def build_media_filter_graph(
         next_out = next_label()
         steps.append(f"[{current}]{filter_expr}[{next_out}]")
         current = next_out
+
+    if motion:
+        motion_filter = build_motion_filter(motion, width, height)
+        if motion_filter:
+            append_filter(motion_filter)
 
     body_font_size = text_renderer.BODY_FONT_SIZE
     title_font_size = text_renderer.TITLE_FONT_SIZE

@@ -6,7 +6,9 @@ from __future__ import annotations
 import argparse
 import shutil
 import sys
+import tempfile
 from pathlib import Path
+from typing import Optional
 
 ROOT_DIR = Path(__file__).resolve().parents[1]
 if str(ROOT_DIR) not in sys.path:
@@ -14,7 +16,10 @@ if str(ROOT_DIR) not in sys.path:
 
 import incremental_builder as ib
 import sequence_to_video as stv
-from lib import text_renderer
+from lib import collage, text_renderer
+from lib.text_utils import combine_overlay_texts
+
+
 
 
 def parse_args() -> argparse.Namespace:
@@ -37,6 +42,7 @@ def configure_environment(config: dict[str, object], verbose: bool) -> None:
     stv.FFMPEG_DEBUG = False
     stv.SHOW_FILENAME = bool(config.get("debug_filename", False))
     stv.LABEL_YEAR = bool(config.get("label_year", False))
+    stv.configure_motion(config)
 
     label_font = config.get("label_font")
     if label_font:
@@ -59,6 +65,12 @@ def configure_environment(config: dict[str, object], verbose: bool) -> None:
     text_renderer.set_font_sizes(title_font_size, body_font_size)
 
 
+def ensure_mp4(path: Path) -> Path:
+    if path.suffix:
+        return path
+    return path.with_suffix(".mp4")
+
+
 def main() -> None:
     args = parse_args()
     config = ib.load_config(args.config)
@@ -68,38 +80,58 @@ def main() -> None:
     if not source_dir.exists():
         raise SystemExit(f"Source directory {source_dir} does not exist.")
 
-    base_files = sorted(path for path in source_dir.glob(f"{args.base}.*") if path.is_file())
-    if not base_files:
-        raise SystemExit(f"No files found for base '{args.base}' in {source_dir}.")
+    visuals, text_files = collage.collect_assets(source_dir, args.base)
+    if not visuals:
+        raise SystemExit(f"No visual files found for base '{args.base}' in {source_dir}.")
 
     duration_image = float(config.get("duration_image", stv.DEFAULT_CONFIG["duration_image"]))
     duration_overlay = float(config.get("duration_overlay", stv.DEFAULT_CONFIG["duration_overlay"]))
-    duration_text = float(config.get("duration_text", stv.DEFAULT_CONFIG["duration_text"]))
 
-    plan = ib.build_segment_plan(base_files, None, duration_image, duration_overlay, duration_text)
-    if not plan:
-        raise SystemExit(f"Unable to build segment plan for base '{args.base}'.")
-
-    segment = next((item for item in plan if item.source.stem == args.base), None)
-    if segment is None:
-        segment = plan[0]
-        if len(plan) > 1:
-            print(f"Warning: multiple segments detected for base '{args.base}', using the first.", flush=True)
+    overlay_layout = None
+    overlay_text = None
+    if text_files:
+        combined_layout = combine_overlay_texts(text_files)
+        if combined_layout.lines or combined_layout.title:
+            overlay_layout = combined_layout
+            overlay_text = combined_layout.overlay_text()
+            if not overlay_text:
+                overlay_text = None
 
     segments_dir = args.segments_dir.resolve()
     ib.ensure_dir(segments_dir)
 
-    output_path = args.output.resolve()
+    output_path = ensure_mp4(args.output).resolve()
     ib.ensure_dir(output_path.parent)
 
     subtitles_root = args.subtitles_dir.resolve() if args.subtitles_dir else segments_dir / "subtitles" / args.base
     ib.ensure_dir(subtitles_root)
 
     ffmpeg_path = shutil.which("ffmpeg") or "ffmpeg"
+    ffprobe_path = shutil.which("ffprobe")
     width, height = stv.parse_resolution(str(config.get("resolution", "1920x1080")))
     fps = int(config.get("fps", stv.DEFAULT_CONFIG["fps"]))
 
-    ib.render_segment(segment, output_path, subtitles_root, width, height, fps, ffmpeg_path, duration_image)
+    segment_duration = duration_overlay if overlay_text else None
+
+    with tempfile.TemporaryDirectory() as tmp_dir_str:
+        temp_dir = Path(tmp_dir_str)
+        if len(visuals) > 1:
+            source_image = collage.build_collage(ffmpeg_path, ffprobe_path, visuals, width, height, temp_dir)
+        else:
+            source_image = visuals[0]
+
+        segment = ib.SegmentInfo(
+            index=1,
+            source=source_image,
+            kind="image",
+            overlay_sources=tuple(text_files),
+            overlay_layout=overlay_layout,
+            overlay_text=overlay_text,
+            duration=segment_duration,
+            visual_sources=tuple(visuals),
+        )
+
+        ib.render_segment(segment, output_path, subtitles_root, width, height, fps, ffmpeg_path, ffprobe_path, duration_image)
 
 
 if __name__ == "__main__":

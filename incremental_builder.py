@@ -26,7 +26,7 @@ except ImportError:  # pragma: no cover - optional dependency
     watchfiles_watch = None
 
 import sequence_to_video as stv
-from lib import text_renderer
+from lib import collage, text_renderer
 from lib.subtitle_renderer import create_ass_subtitle
 from lib.text_utils import TextLayout, combine_overlay_texts, load_text_layout
 
@@ -42,6 +42,7 @@ class SegmentInfo:
     overlay_layout: Optional[TextLayout] = None
     overlay_text: Optional[str] = None
     duration: Optional[float] = None
+    visual_sources: tuple[Path, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -107,8 +108,23 @@ def load_config(config_path: Path) -> dict[str, object]:
     return stv.load_config(config_path)
 
 
+def iter_media_prefixes(source_dir: Path) -> Iterable[str]:
+    seen: set[str] = set()
+    for path in sorted(source_dir.iterdir(), key=lambda p: p.name):
+        if not path.is_file():
+            continue
+        suffix = path.suffix.lower()
+        if suffix not in stv.IMAGE_EXTENSIONS and suffix not in stv.VIDEO_EXTENSIONS:
+            continue
+        prefix = path.stem.split("_", 1)[0]
+        if prefix in seen:
+            continue
+        seen.add(prefix)
+        yield prefix
+
+
 def list_media(source_dir: Path) -> List[Path]:
-    return sorted(p for p in source_dir.iterdir() if p.is_file())
+    return [source_dir / prefix for prefix in iter_media_prefixes(source_dir)]
 
 
 def build_segment_plan(
@@ -123,67 +139,39 @@ def build_segment_plan(
     else:
         selected = list(media_files)
 
-    media_stems_with_visual = {
-        path.stem
-        for path in selected
-        if path.suffix.lower() in stv.IMAGE_EXTENSIONS
-        or path.suffix.lower() in stv.VIDEO_EXTENSIONS
-    }
-
-    overlay_text_map: dict[str, list[Path]] = {}
-    overlay_text_paths: set[Path] = set()
-    for path in selected:
-        suffix = path.suffix.lower()
-        if suffix in stv.TEXT_EXTENSIONS and path.stem in media_stems_with_visual:
-            overlay_text_map.setdefault(path.stem, []).append(path)
-            overlay_text_paths.add(path)
-
     plan: List[SegmentInfo] = []
     index = 0
-    for media in selected:
-        suffix = media.suffix.lower()
-        if suffix in stv.IMAGE_EXTENSIONS or suffix in stv.VIDEO_EXTENSIONS:
-            overlay_sources = tuple(overlay_text_map.get(media.stem, []))
-            overlay_layout: Optional[TextLayout] = None
-            overlay_text: Optional[str] = None
-            if overlay_sources:
-                combined = combine_overlay_texts(overlay_sources)
-                if combined.lines or combined.title:
-                    overlay_layout = combined
-                    overlay_text = combined.overlay_text()
-            duration_value: Optional[float] = None
-            if suffix in stv.IMAGE_EXTENSIONS:
-                duration_value = duration_overlay if overlay_text else duration_image
-            plan.append(
-                SegmentInfo(
-                    index=index + 1,
-                    source=media,
-                    kind="image" if suffix in stv.IMAGE_EXTENSIONS else "video",
-                    overlay_sources=overlay_sources,
-                    overlay_layout=overlay_layout,
-                    overlay_text=overlay_text,
-                    duration=duration_value,
-                )
+    for entry in selected:
+        prefix = entry.name
+        visuals, overlays = collage.collect_assets(entry.parent, prefix)
+        if not visuals:
+            continue
+
+        overlay_layout: Optional[TextLayout] = None
+        overlay_text: Optional[str] = None
+        if overlays:
+            combined = combine_overlay_texts(overlays)
+            if combined.lines or combined.title:
+                overlay_layout = combined
+                overlay_text = combined.overlay_text()
+                if not overlay_text:
+                    overlay_text = None
+
+        duration_value: Optional[float] = duration_overlay if overlay_text else duration_image
+
+        plan.append(
+            SegmentInfo(
+                index=index + 1,
+                source=visuals[0],
+                kind="image",
+                overlay_sources=tuple(overlays),
+                overlay_layout=overlay_layout,
+                overlay_text=overlay_text,
+                duration=duration_value,
+                visual_sources=tuple(visuals),
             )
-            index += 1
-        elif suffix in stv.TEXT_EXTENSIONS:
-            if media in overlay_text_paths:
-                continue
-            layout = load_text_layout(media)
-            plan.append(
-                SegmentInfo(
-                    index=index + 1,
-                    source=media,
-                    kind="text",
-                    overlay_sources=(),
-                    overlay_layout=layout,
-                    overlay_text=None,
-                    duration=duration_text,
-                )
-            )
-            index += 1
-        else:
-            print(f"Skipping unsupported file {media.name}")
+        )
+        index += 1
 
     return plan
 
@@ -193,9 +181,15 @@ def ensure_dir(path: Path) -> None:
 
 
 def list_dependencies(segment: SegmentInfo) -> List[Path]:
-    deps = [segment.source]
-    deps.extend(segment.overlay_sources)
-    return deps
+    deps_set: List[Path] = []
+    visuals = list(segment.visual_sources)
+    if visuals:
+        deps_set.extend(visuals)
+    else:
+        deps_set.append(segment.source)
+    for overlay in segment.overlay_sources:
+        deps_set.append(overlay)
+    return deps_set
 
 
 def needs_render(
@@ -225,6 +219,7 @@ def render_image_segment(
     height: int,
     fps: int,
     ffmpeg_path: str,
+    ffprobe_path: Optional[str],
     default_duration: float,
 ) -> None:
     overlay_subtitle_path: Optional[Path] = None
@@ -245,6 +240,7 @@ def render_image_segment(
     still_duration = segment.duration or default_duration
     label = stv.infer_year_text(segment.source)
     debug_text = segment.source.name if stv.SHOW_FILENAME else None
+    motion_plan = stv.get_motion_plan(segment.index, still_duration, fps)
     filter_graph, filter_output = stv.build_media_filter_graph(
         width,
         height,
@@ -252,49 +248,67 @@ def render_image_segment(
         label,
         debug_text,
         overlay_subtitle_path,
+        motion_plan,
     )
-    cmd = [
-        ffmpeg_path,
-        "-hide_banner",
-        "-loglevel",
-        "error",
-        "-y",
-        "-loop",
-        "1",
-        "-framerate",
-        str(fps),
-        "-t",
-        f"{still_duration}",
-        "-i",
-        str(segment.source),
-        "-f",
-        "lavfi",
-        "-t",
-        f"{still_duration}",
-        "-i",
-        "anullsrc=channel_layout=stereo:sample_rate=48000",
-        "-shortest",
-        "-filter_complex",
-        filter_graph,
-        "-map",
-        f"[{filter_output}]",
-        "-map",
-        "1:a:0",
-        "-c:v",
-        "libx264",
-        "-pix_fmt",
-        "yuv420p",
-        "-r",
-        str(fps),
-        "-c:a",
-        "aac",
-        "-b:a",
-        "192k",
-        "-movflags",
-        "+faststart",
-        str(output_path),
-    ]
-    stv.run_ffmpeg(cmd)
+    def _render_with_input(input_path: Path) -> None:
+        cmd = [
+            ffmpeg_path,
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-y",
+            "-loop",
+            "1",
+            "-framerate",
+            str(fps),
+            "-t",
+            f"{still_duration}",
+            "-i",
+            str(input_path),
+            "-f",
+            "lavfi",
+            "-t",
+            f"{still_duration}",
+            "-i",
+            "anullsrc=channel_layout=stereo:sample_rate=48000",
+            "-shortest",
+            "-filter_complex",
+            filter_graph,
+            "-map",
+            f"[{filter_output}]",
+            "-map",
+            "1:a:0",
+            "-c:v",
+            "libx264",
+            "-pix_fmt",
+            "yuv420p",
+            "-r",
+            str(fps),
+            "-c:a",
+            "aac",
+            "-b:a",
+            "192k",
+            "-movflags",
+            "+faststart",
+            str(output_path),
+        ]
+        stv.run_ffmpeg(cmd)
+
+    visuals = list(segment.visual_sources) or [segment.source]
+    if len(visuals) > 1:
+        with tempfile.TemporaryDirectory() as tmp_dir_str:
+            tmp_dir = Path(tmp_dir_str)
+            source_image = collage.build_collage(
+                ffmpeg_path,
+                ffprobe_path,
+                visuals,
+                width,
+                height,
+                tmp_dir,
+            )
+            _render_with_input(source_image)
+    else:
+        _render_with_input(visuals[0])
 
 
 def render_video_segment(
@@ -378,6 +392,7 @@ def render_segment(
     height: int,
     fps: int,
     ffmpeg_path: str,
+    ffprobe_path: Optional[str],
     default_duration: float,
 ) -> None:
     if segment.kind == "image":
@@ -389,6 +404,7 @@ def render_segment(
             height,
             fps,
             ffmpeg_path,
+            ffprobe_path,
             default_duration,
         )
     elif segment.kind == "video":
@@ -612,6 +628,7 @@ def diff_snapshot(old: Dict[Path, float], new: Dict[Path, float]) -> List[Path]:
 
 def run_build(args: argparse.Namespace, announce_audio: bool = True) -> BuildContext:
     config = load_config(args.config)
+    stv.configure_motion(config)
 
     stv.VERBOSE = False
     stv.FFMPEG_DEBUG = False
@@ -693,6 +710,7 @@ def run_build(args: argparse.Namespace, announce_audio: bool = True) -> BuildCon
     additional_mtime = max(config_mtime, script_mtime)
 
     ffmpeg_path = shutil.which("ffmpeg") or "ffmpeg"
+    ffprobe_path = shutil.which("ffprobe")
 
     force_rebuild = args.force or not has_existing_output(base_output)
     expected_segments: Set[Path] = set()
@@ -731,6 +749,7 @@ def run_build(args: argparse.Namespace, announce_audio: bool = True) -> BuildCon
                 height,
                 fps,
                 ffmpeg_path,
+                ffprobe_path,
                 duration_image,
             )
 
@@ -799,6 +818,7 @@ def run_build(args: argparse.Namespace, announce_audio: bool = True) -> BuildCon
 
 def watch_loop(args: argparse.Namespace) -> None:
     initial_config = load_config(args.config)
+    stv.configure_motion(initial_config)
     audio_entries = [Path(entry) for entry in initial_config.get("audio_files", []) if entry]
     if audio_entries:
         resolved, _ = stv.resolve_audio_files(audio_entries)
@@ -843,6 +863,9 @@ def watch_loop(args: argparse.Namespace) -> None:
 
 def main() -> None:
     args = parse_args()
+    if args.output:
+        if not args.output.suffix:
+            args.output = args.output.with_suffix(".mp4")
     if args.watch:
         watch_loop(args)
     else:
