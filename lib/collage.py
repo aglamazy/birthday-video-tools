@@ -124,6 +124,8 @@ def _layout_positions(
         return [(col_x(0), row_y(0)), (col_x(0), row_y(1))]
 
     if count == 3:
+        if rows == 1:
+            return [(col_x(0), row_y(0)), (col_x(1), row_y(0)), (col_x(2), row_y(0))]
         top = [(col_x(0), row_y(0)), (col_x(1), row_y(0))]
         content_width = cols * cell_w + (cols - 1) * padding
         center_x = padding + (content_width - cell_w) // 2
@@ -160,7 +162,10 @@ def build_collage(
         else:
             cols, rows = 2, 1
     elif len(images) == 3:
-        cols, rows = 2, 2
+        if all(o == "portrait" for o in orientations if o != "unknown"):
+            cols, rows = 3, 1
+        else:
+            cols, rows = 2, 2
     elif len(images) == 4:
         cols, rows = 2, 2
     else:

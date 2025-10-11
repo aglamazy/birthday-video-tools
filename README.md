@@ -11,8 +11,15 @@ Utilities for organising a raw photo dump into dated folders, generating a chron
 - `convert_heic.py` – converts/renames HEIC/HEIF files within `sequence/`
 - `sequence_to_video.py` – renders the slideshow MP4 (and optional timeline audio)
 - `extract_audio.py` – trims audio out of a video file into an MP3 snippet
-- `lib/` – shared helpers used by the renderer (`text_utils.py`, `text_renderer.py`, `subtitle_renderer.py`)
+- `incremental_builder.py` – incremental slide renderer with cache + watcher
+- `lib/` – shared helpers used by the renderer (`text_utils.py`, `text_renderer.py`, `subtitle_renderer.py`, `collage.py`)
 - `find_duplicates.py` – detects duplicate or visually similar photos
+
+## Recent Changes
+
+- Slides that share a prefix (e.g., `1978-0001.jpg`, `1978-0001_2.jpg`) are combined into a padded collage for both full renders and incremental builds; matching text overlays drive captions for the entire group.
+- Text overlays can include directives such as `@duration: 8` to keep a slide on screen for a fixed number of seconds.
+- Output filenames default to `.mp4` if no extension is provided (`--output test` now produces `test.mp4`).
 
 ## Environment Setup
 
@@ -90,6 +97,17 @@ Utilities for organising a raw photo dump into dated folders, generating a chron
 
 Blank lines add spacing; leading `#` renders as a headline; indented bullets create nested lists.
 
+Optional directives can sit at the very top of the file. For example:
+
+```
+@duration: 8
+# Surprise Party
+- Decorations by Dana
+- Cake by Amir
+```
+
+`@duration: 8` keeps that slide visible for eight seconds in both the full renderer and the incremental builder.
+
 ## Script Reference
 
 ### `photo_sorter.py`
@@ -152,6 +170,7 @@ python sequence_to_video.py [--source-dir sequence]
 - Global mixes: pass `--audio-file background.mp3` to append a traditional soundtrack instead of per-slide cues.
 - Use `--chunk-size 120 --batch` to render every 120-item slice automatically (outputs `slideshow-1.mp4`, `slideshow-2.mp4`, ...). For a single slice, combine `--chunk-size` with `--chunk-index`.
 - Tweak typography via `title_font_size` / `body_font_size` in `config.json`.
+- Slides sharing a prefix (`1978-0001.jpg`, `1978-0001_2.jpg`, …) are combined into a padded collage; matching `.txt` overlays annotate the entire group and can add directives such as `@duration: 8` to keep the slide visible longer.
 
 ### `find_duplicates.py`
 
@@ -167,6 +186,7 @@ python find_duplicates.py [root] [--follow-links] [--min-size BYTES] [--deep] [-
 - Use `extract_audio.py` to clean lead-in silence before dropping tracks into `sequence/`.
 - Run `sequence_to_video.py --verbose` for concise `[idx/total]` progress, and `--debug-ffmpeg` when you need the exact command lines.
 - If `--label-year` warns about a missing font, point to a suitable `.ttf`/`.otf` via `--label-font`.
+- When a slide needs more time, add `@duration: N` (seconds) to the top of its `.txt` overlay; both renderers respect the override.
 
 ## License
 
@@ -182,11 +202,12 @@ python incremental_builder.py [--segments-dir segments]
                               [--limit N] [--verbose] [--force]
                               [--watch] [--interval 1.0]
 ```
-- Renders each slide into `segments/segment_XXXX.mp4`, reusing cached segments when sources are unchanged.
+- Renders each slide into `segments/segment_XXXX.mp4`, reusing cached segments when sources are unchanged. Image groups (`prefix_*.jpg`) are combined into collages before rendering so they mirror the main slideshow output.
 - After updating the necessary segments, emits a versioned MP4 (e.g., `slideshow-001.mp4`) and attaches any audio tracks listed in `config.json`.
 - Use `--force` to rebuild everything, or simply edit media/text files and rerun for incremental updates.
 - Add `--watch` to keep rebuilding automatically when `sequence/`, `config.json`, or configured audio tracks change (requires the `watchfiles` package for event-driven mode; falls back to polling otherwise).
   - Install with `python -m pip install watchfiles` (optional).
+- Text overlays honour the same `@duration: N` directive as the main renderer.
 
 ### `watch_incremental.py`
 

@@ -659,17 +659,30 @@ def render_slideshow(
         overlay_subtitle_path: Optional[Path] = None
         if overlays:
             combined_layout = combine_overlay_texts(overlays)
-            if combined_layout.lines or combined_layout.title:
+            if combined_layout.lines or combined_layout.title or combined_layout.metadata:
                 overlay_layout = combined_layout
                 overlay_text_value = combined_layout.overlay_text()
                 if not overlay_text_value:
                     overlay_text_value = None
 
+        duration_override: Optional[float] = None
+        if overlay_layout:
+            duration_str = overlay_layout.metadata.get("duration")
+            if duration_str:
+                try:
+                    duration_override = float(duration_str)
+                except ValueError:
+                    duration_override = None
+
         if image_files:
             primary_source = image_files[0]
             segment_index += 1
             segment_path = temp_dir_path / f"segment_{segment_index:04d}.mp4"
-            duration_value = args.duration_overlay if overlay_text_value else args.duration_image
+            duration_value = (
+                duration_override
+                if duration_override is not None
+                else (args.duration_overlay if overlay_text_value else args.duration_image)
+            )
             if overlay_layout and overlay_text_value:
                 overlay_subtitle_path = subtitle_renderer.create_ass_subtitle(
                     overlay_layout,
@@ -733,6 +746,13 @@ def render_slideshow(
             segment_index += 1
             segment_path = temp_dir_path / f"segment_{segment_index:04d}.mp4"
             text_layout = overlay_layout if overlay_layout else combine_overlay_texts(overlays)
+            if duration_override is None:
+                duration_str = text_layout.metadata.get("duration")
+                if duration_str:
+                    try:
+                        duration_override = float(duration_str)
+                    except ValueError:
+                        duration_override = None
             panel_image = text_renderer.render_text_panel(
                 text_layout,
                 width,
@@ -741,15 +761,16 @@ def render_slideshow(
                 background=True,
                 output_dir=text_panel_temp_dir,
             )
+            text_duration = duration_override if duration_override is not None else args.duration_text
             segments.append(
                 Segment(
                     source=overlays[0],
                     output=segment_path,
                     kind="text",
                     text_layout=text_layout,
-                    duration=args.duration_text,
+                    duration=text_duration,
                     panel_image=panel_image,
-                    expected_duration=args.duration_text,
+                    expected_duration=text_duration,
                 )
             )
             segment_index_by_prefix[prefix] = len(segments) - 1

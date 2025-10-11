@@ -147,28 +147,61 @@ def build_segment_plan(
         if not visuals:
             continue
 
+        image_files = [path for path in visuals if path.suffix.lower() in stv.IMAGE_EXTENSIONS]
+        video_files = [path for path in visuals if path.suffix.lower() in stv.VIDEO_EXTENSIONS]
+
         overlay_layout: Optional[TextLayout] = None
         overlay_text: Optional[str] = None
         if overlays:
             combined = combine_overlay_texts(overlays)
-            if combined.lines or combined.title:
+            if combined.lines or combined.title or combined.metadata:
                 overlay_layout = combined
                 overlay_text = combined.overlay_text()
                 if not overlay_text:
                     overlay_text = None
 
-        duration_value: Optional[float] = duration_overlay if overlay_text else duration_image
+        duration_override: Optional[float] = None
+        if overlay_layout:
+            duration_str = overlay_layout.metadata.get("duration")
+            if duration_str:
+                try:
+                    duration_override = float(duration_str)
+                except ValueError:
+                    duration_override = None
+
+        if video_files and not image_files:
+            plan.append(
+                SegmentInfo(
+                    index=index + 1,
+                    source=video_files[0],
+                    kind="video",
+                    overlay_sources=tuple(overlays),
+                    overlay_layout=overlay_layout,
+                    overlay_text=overlay_text,
+                    duration=None,
+                    visual_sources=tuple(video_files),
+                )
+            )
+            index += 1
+            continue
+
+        image_sources = image_files if image_files else visuals
+        duration_value: Optional[float] = (
+            duration_override
+            if duration_override is not None
+            else (duration_overlay if overlay_text else duration_image)
+        )
 
         plan.append(
             SegmentInfo(
                 index=index + 1,
-                source=visuals[0],
+                source=image_sources[0],
                 kind="image",
                 overlay_sources=tuple(overlays),
                 overlay_layout=overlay_layout,
                 overlay_text=overlay_text,
                 duration=duration_value,
-                visual_sources=tuple(visuals),
+                visual_sources=tuple(image_sources),
             )
         )
         index += 1

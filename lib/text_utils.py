@@ -59,6 +59,7 @@ class LineInfo:
 class TextLayout:
     title: str | None
     lines: List[LineInfo]
+    metadata: dict[str, str]
 
     @property
     def body_lines(self) -> List[str]:
@@ -92,12 +93,24 @@ def load_text_layout(path: Path) -> TextLayout:
     title: str | None = None
     lines: List[LineInfo] = []
 
+    metadata: dict[str, str] = {}
+    content_started = False
+
     for raw_line in raw_content.splitlines():
         if not raw_line.strip():
-            lines.append(LineInfo("blank", 0, "", "", align="right"))
+            if content_started:
+                lines.append(LineInfo("blank", 0, "", "", align="right"))
             continue
 
         stripped = raw_line.strip()
+        if not content_started and stripped.startswith("@") and ":" in stripped:
+            key, _, value = stripped.partition(":")
+            key = key.lstrip("@").strip().lower()
+            if key:
+                metadata[key] = value.strip()
+            continue
+
+        content_started = True
         if stripped.startswith("#"):
             token = stripped.lstrip("#").strip()
             if title is None and token:
@@ -130,7 +143,7 @@ def load_text_layout(path: Path) -> TextLayout:
         fallback_align = _line_alignment(fallback)
         lines.append(LineInfo("text", 0, fallback, fallback, align=fallback_align))
 
-    layout = TextLayout(title=title, lines=lines)
+    layout = TextLayout(title=title, lines=lines, metadata=metadata)
 
     return layout
 
@@ -138,14 +151,18 @@ def load_text_layout(path: Path) -> TextLayout:
 def combine_overlay_texts(paths: Iterable[Path]) -> TextLayout:
     combined_lines: List[LineInfo] = []
     title: str | None = None
+    metadata: dict[str, str] = {}
     for overlay_path in paths:
         layout = load_text_layout(overlay_path)
         if title is None and layout.title:
             title = layout.title
+        for key, value in layout.metadata.items():
+            if key not in metadata and value:
+                metadata[key] = value
         for line in layout.lines:
             if line.kind == "blank":
                 continue
             if not line.display.strip():
                 continue
             combined_lines.append(line)
-    return TextLayout(title=title, lines=combined_lines)
+    return TextLayout(title=title, lines=combined_lines, metadata=metadata)

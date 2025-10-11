@@ -18,8 +18,17 @@
   ],
   "transitions": {
     "enabled": false,
-    "allowed": [
-      "slide_left"
+    "motions": [
+      "zoom_in",
+      "zoom_out",
+      "pan_right",
+      "pan_left",
+      "pan_up",
+      "pan_down",
+      "pan_diag_up_right",
+      "pan_diag_down_left",
+      "pan_diag_up_left",
+      "pan_diag_down_right"
     ],
     "duration": 1.0
   }

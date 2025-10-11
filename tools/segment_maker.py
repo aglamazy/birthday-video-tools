@@ -84,6 +84,9 @@ def main() -> None:
     if not visuals:
         raise SystemExit(f"No visual files found for base '{args.base}' in {source_dir}.")
 
+    image_files = [path for path in visuals if path.suffix.lower() in stv.IMAGE_EXTENSIONS]
+    video_files = [path for path in visuals if path.suffix.lower() in stv.VIDEO_EXTENSIONS]
+
     duration_image = float(config.get("duration_image", stv.DEFAULT_CONFIG["duration_image"]))
     duration_overlay = float(config.get("duration_overlay", stv.DEFAULT_CONFIG["duration_overlay"]))
 
@@ -91,11 +94,20 @@ def main() -> None:
     overlay_text = None
     if text_files:
         combined_layout = combine_overlay_texts(text_files)
-        if combined_layout.lines or combined_layout.title:
+        if combined_layout.lines or combined_layout.title or combined_layout.metadata:
             overlay_layout = combined_layout
             overlay_text = combined_layout.overlay_text()
             if not overlay_text:
                 overlay_text = None
+
+    duration_override: Optional[float] = None
+    if overlay_layout:
+        duration_str = overlay_layout.metadata.get("duration")
+        if duration_str:
+            try:
+                duration_override = float(duration_str)
+            except ValueError:
+                duration_override = None
 
     segments_dir = args.segments_dir.resolve()
     ib.ensure_dir(segments_dir)
@@ -111,24 +123,35 @@ def main() -> None:
     width, height = stv.parse_resolution(str(config.get("resolution", "1920x1080")))
     fps = int(config.get("fps", stv.DEFAULT_CONFIG["fps"]))
 
-    segment_duration = duration_overlay if overlay_text else None
+    is_video = bool(video_files) and not image_files
+    segment_duration = None if is_video else (
+        duration_override if duration_override is not None else (duration_overlay if overlay_text else duration_image)
+    )
 
     with tempfile.TemporaryDirectory() as tmp_dir_str:
         temp_dir = Path(tmp_dir_str)
-        if len(visuals) > 1:
-            source_image = collage.build_collage(ffmpeg_path, ffprobe_path, visuals, width, height, temp_dir)
+        if is_video:
+            source_path = video_files[0]
+            visual_sources = tuple(video_files)
+            segment_kind = "video"
         else:
-            source_image = visuals[0]
+            source_images = image_files if image_files else visuals
+            if len(source_images) > 1:
+                source_path = collage.build_collage(ffmpeg_path, ffprobe_path, source_images, width, height, temp_dir)
+            else:
+                source_path = source_images[0]
+            visual_sources = tuple(source_images)
+            segment_kind = "image"
 
         segment = ib.SegmentInfo(
             index=1,
-            source=source_image,
-            kind="image",
+            source=source_path,
+            kind=segment_kind,
             overlay_sources=tuple(text_files),
             overlay_layout=overlay_layout,
             overlay_text=overlay_text,
             duration=segment_duration,
-            visual_sources=tuple(visuals),
+            visual_sources=visual_sources,
         )
 
         ib.render_segment(segment, output_path, subtitles_root, width, height, fps, ffmpeg_path, ffprobe_path, duration_image)
