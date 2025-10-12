@@ -498,6 +498,8 @@ def mux_audio_tracks(
     source_video: Path,
     target_video: Path,
     audio_paths: Sequence[Path],
+    ffprobe_path: Optional[str],
+    video_duration: Optional[float],
 ) -> None:
     existing_sources = [path for path in audio_paths if path.exists()]
     if not existing_sources:
@@ -507,8 +509,15 @@ def mux_audio_tracks(
     with tempfile.TemporaryDirectory() as tmp_dir_str:
         tmp_dir = Path(tmp_dir_str)
         combined_audio = tmp_dir / "combined_audio.m4a"
+        adjusted_sources = stv._adjust_audio_tracks(
+            ffmpeg_path,
+            list(existing_sources),
+            video_duration,
+            ffprobe_path,
+            tmp_dir,
+        )
 
-        if len(existing_sources) == 1:
+        if len(adjusted_sources) == 1:
             stv.run_ffmpeg(
                 [
                     ffmpeg_path,
@@ -517,7 +526,7 @@ def mux_audio_tracks(
                     "error",
                     "-y",
                     "-i",
-                    str(existing_sources[0]),
+                    str(adjusted_sources[0]),
                     "-c:a",
                     "aac",
                     "-ac",
@@ -535,11 +544,11 @@ def mux_audio_tracks(
                 "error",
                 "-y",
             ]
-            for source in existing_sources:
+            for source in adjusted_sources:
                 concat_cmd.extend(["-i", str(source)])
-            filter_inputs = "".join(f"[{idx}:a]" for idx in range(len(existing_sources)))
+            filter_inputs = "".join(f"[{idx}:a]" for idx in range(len(adjusted_sources)))
             filter_complex = (
-                f"{filter_inputs}concat=n={len(existing_sources)}:v=0:a=1[aout]"
+                f"{filter_inputs}concat=n={len(adjusted_sources)}:v=0:a=1[aout]"
             )
             concat_cmd.extend(
                 [
@@ -810,6 +819,7 @@ def run_build(args: argparse.Namespace, announce_audio: bool = True) -> BuildCon
             watch_paths.add(resolved_audio.parent)
             input_paths.add(resolved_audio)
             input_paths.add(resolved_audio.parent)
+        video_duration = stv.probe_media_duration(ffprobe_path, intermediate_output)
         if audio_paths:
             resolved, missing = stv.resolve_audio_files(audio_paths)
             for missing_path in missing:
@@ -818,7 +828,7 @@ def run_build(args: argparse.Namespace, announce_audio: bool = True) -> BuildCon
                 if announce_audio and args.verbose:
                     resolved_list = ", ".join(path.as_posix() for path in resolved)
                     print(f"using audio tracks: {resolved_list}")
-                mux_audio_tracks(ffmpeg_path, intermediate_output, final_output, resolved)
+                mux_audio_tracks(ffmpeg_path, intermediate_output, final_output, resolved, ffprobe_path, video_duration)
                 audio_attached = True
                 resolved_parents = {path.resolve().parent for path in resolved}
                 watch_paths.update(path.resolve() for path in resolved)

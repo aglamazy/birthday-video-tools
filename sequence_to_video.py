@@ -984,6 +984,7 @@ def render_slideshow(
             ]
         )
         print(f"Created {output_path}")
+        video_duration = probe_media_duration(ffprobe_path, output_path)
         if audio_entries:
             audio_output_path = output_path.with_name(f"{output_path.stem}_audio.mp3")
             create_timeline_audio(ffmpeg_path, audio_entries, audio_output_path)
@@ -993,7 +994,7 @@ def render_slideshow(
             mux_video_with_audio(ffmpeg_path, output_path, audio_output_path, final_output_path)
             print(f"Created {final_output_path}")
         elif resolved_audio_paths:
-            apply_audio_track(ffmpeg_path, output_path, resolved_audio_paths)
+            apply_audio_track(ffmpeg_path, output_path, resolved_audio_paths, ffprobe_path, video_duration)
     finally:
         if tmp_dir_ctx:
             tmp_dir_ctx.cleanup()
@@ -1227,10 +1228,104 @@ def run_ffmpeg(cmd: Iterable[str]) -> None:
         print(result.stdout.strip())
 
 
+def _probe_durations(paths: Sequence[Path], ffprobe_path: Optional[str]) -> list[Optional[float]]:
+    durations: list[Optional[float]] = []
+    for path in paths:
+        durations.append(probe_media_duration(ffprobe_path, path))
+    return durations
+
+
+def _trim_audio_tail(
+    ffmpeg_path: str,
+    source_path: Path,
+    target_duration: float,
+    tmp_dir: Path,
+) -> Path:
+    output_path = tmp_dir / f"trimmed_{source_path.stem}.m4a"
+    fade_duration = min(1.0, max(0.0, target_duration / 2.0))
+    filters = [f"atrim=duration={target_duration}"]
+    if fade_duration > 0:
+        filters.append(f"afade=t=out:st={target_duration - fade_duration}:d={fade_duration}")
+    filter_complex = ",".join(filters)
+    run_ffmpeg(
+        [
+            ffmpeg_path,
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-y",
+            "-i",
+            str(source_path),
+            "-filter_complex",
+            filter_complex,
+            "-c:a",
+            "aac",
+            "-ac",
+            "2",
+            "-ar",
+            "48000",
+            str(output_path),
+        ]
+    )
+    return output_path
+
+
+def _adjust_audio_tracks(
+    ffmpeg_path: str,
+    sources: list[Path],
+    video_duration: Optional[float],
+    ffprobe_path: Optional[str],
+    tmp_dir: Path,
+) -> list[Path]:
+    if video_duration is None or len(sources) <= 1:
+        return sources
+
+    durations = _probe_durations(sources, ffprobe_path)
+    if any(duration is None for duration in durations):
+        return sources
+
+    total_audio = sum(durations)  # type: ignore[arg-type]
+    excess = total_audio - video_duration
+    if excess <= 0:
+        return sources
+
+    adjusted = list(sources)
+    min_length = 0.5
+
+    for idx in range(len(sources) - 2, -1, -1):
+        if excess <= 0:
+            break
+        current_duration = durations[idx]  # type: ignore[index]
+        if current_duration is None or current_duration <= min_length:
+            continue
+        max_trim = current_duration - min_length
+        trim_amount = min(excess, max_trim)
+        target_duration = current_duration - trim_amount
+        trimmed_path = _trim_audio_tail(ffmpeg_path, adjusted[idx], target_duration, tmp_dir)
+        adjusted[idx] = trimmed_path
+        durations[idx] = target_duration
+        excess -= trim_amount
+
+    if excess > 0:
+        # As a last resort trim the final track, but keep it at least min_length.
+        last_idx = len(sources) - 1
+        last_duration = durations[last_idx]  # type: ignore[index]
+        if last_duration and last_duration > min_length:
+            max_trim = max(0.0, last_duration - min_length)
+            trim_amount = min(excess, max_trim)
+            target_duration = last_duration - trim_amount
+            trimmed_path = _trim_audio_tail(ffmpeg_path, adjusted[last_idx], target_duration, tmp_dir)
+            adjusted[last_idx] = trimmed_path
+
+    return adjusted
+
+
 def apply_audio_track(
     ffmpeg_path: str,
     video_path: Path,
     audio_paths: Sequence[Path],
+    ffprobe_path: Optional[str] = None,
+    video_duration: Optional[float] = None,
 ) -> None:
     if not audio_paths:
         return
@@ -1242,8 +1337,15 @@ def apply_audio_track(
     with tempfile.TemporaryDirectory() as tmp_dir:
         tmp_dir_path = Path(tmp_dir)
         combined_audio = tmp_dir_path / "combined_audio.m4a"
+        adjusted_sources = _adjust_audio_tracks(
+            ffmpeg_path,
+            list(existing_sources),
+            video_duration,
+            ffprobe_path,
+            tmp_dir_path,
+        )
 
-        if len(existing_sources) == 1:
+        if len(adjusted_sources) == 1:
             run_ffmpeg(
                 [
                     ffmpeg_path,
@@ -1252,7 +1354,7 @@ def apply_audio_track(
                     "error",
                     "-y",
                     "-i",
-                    str(existing_sources[0]),
+                    str(adjusted_sources[0]),
                     "-c:a",
                     "aac",
                     "-ac",
@@ -1270,11 +1372,11 @@ def apply_audio_track(
                 "error",
                 "-y",
             ]
-            for source in existing_sources:
+            for source in adjusted_sources:
                 concat_cmd.extend(["-i", str(source)])
-            filter_inputs = "".join(f"[{idx}:a]" for idx in range(len(existing_sources)))
+            filter_inputs = "".join(f"[{idx}:a]" for idx in range(len(adjusted_sources)))
             filter_complex = (
-                f"{filter_inputs}concat=n={len(existing_sources)}:v=0:a=1[aout]"
+                f"{filter_inputs}concat=n={len(adjusted_sources)}:v=0:a=1[aout]"
             )
             concat_cmd.extend(
                 [

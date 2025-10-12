@@ -132,6 +132,20 @@ def _layout_positions(
         bottom = (center_x, row_y(1))
         return top + [bottom]
 
+    if count == 5 and rows == 2 and cols >= 3:
+        # place two images in the first row, centered, and three in the second row
+        total_width = cols * cell_w + (cols - 1) * padding
+        top_band_width = 2 * cell_w + padding
+        offset = padding + max(0, (total_width - top_band_width) // 2)
+        top_positions = [
+            (offset, row_y(0)),
+            (offset + cell_w + padding, row_y(0)),
+        ]
+        bottom_positions = []
+        for idx in range(3):
+            bottom_positions.append((col_x(idx), row_y(1)))
+        return top_positions + bottom_positions
+
     positions: list[tuple[int, int]] = []
     for idx in range(count):
         col = idx % cols
@@ -156,11 +170,7 @@ def build_collage(
     orientations = [classify_orientation(path, ffprobe_path) for path in images]
 
     if len(images) == 2:
-        same_orientation = orientations[0] == orientations[1]
-        if same_orientation and orientations[0] == "landscape":
-            cols, rows = 1, 2
-        else:
-            cols, rows = 2, 1
+        cols, rows = 2, 1
     elif len(images) == 3:
         if all(o == "portrait" for o in orientations if o != "unknown"):
             cols, rows = 3, 1
