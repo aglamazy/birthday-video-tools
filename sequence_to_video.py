@@ -987,7 +987,7 @@ def render_slideshow(
         video_duration = probe_media_duration(ffprobe_path, output_path)
         if audio_entries:
             audio_output_path = output_path.with_name(f"{output_path.stem}_audio.mp3")
-            create_timeline_audio(ffmpeg_path, audio_entries, audio_output_path)
+            create_timeline_audio(ffmpeg_path, audio_entries, audio_output_path, video_duration)
             final_output_path = output_path.with_name(
                 f"{output_path.stem}_with_audio{output_path.suffix}"
             )
@@ -1546,6 +1546,7 @@ def create_timeline_audio(
     ffmpeg_path: str,
     entries: Sequence[AudioTimelineEntry],
     output_path: Path,
+    target_duration: Optional[float] = None,
 ) -> None:
     if not entries:
         return
@@ -1586,6 +1587,18 @@ def create_timeline_audio(
         f"{mix_clause}amix=inputs={mix_count}:dropout_transition=0,"
         "aformat=sample_fmts=s16:sample_rates=44100:channel_layouts=stereo[mix]"
     )
+
+    final_label = "[mix]"
+    if target_duration is not None and target_duration > 0:
+        fade = min(1.0, max(0.0, target_duration / 10.0))
+        trim_filter = f"[mix]atrim=0:{target_duration:.6f},asetpts=PTS-STARTPTS"
+        if fade > 0:
+            fade_start = max(0.0, target_duration - fade)
+            trim_filter += f",afade=t=out:st={fade_start:.6f}:d={fade:.6f}"
+        trim_filter += "[trimmed]"
+        filter_parts.append(trim_filter)
+        final_label = "[trimmed]"
+
     filter_graph = ";".join(filter_parts)
 
     cmd = [
@@ -1597,7 +1610,7 @@ def create_timeline_audio(
         "-filter_complex",
         filter_graph,
         "-map",
-        "[mix]",
+        final_label,
         "-c:a",
         "libmp3lame",
         "-ar",

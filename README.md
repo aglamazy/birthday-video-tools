@@ -166,7 +166,7 @@ python sequence_to_video.py [--source-dir sequence]
 - `--keep-temp` retains intermediate `segment_*.mp4` + subtitle PNGs for debugging.
 - `--start-at` jumps directly to the first file matching a given name (useful for resuming long renders).
 - `--debug-filename` overlays each slide's original filename in the top-left corner—handy when auditing sequences.
-- Audio cues: add `NNN.mp3` alongside `NNN.jpg` (or `.mp4`). Each cue plays until the next cue and crossfades over the transition.
+- Audio cues: add `NNN.mp3` alongside `NNN.jpg` (or `.mp4`). Each cue plays until the next cue and crossfades over the transition. If the combined cues run past the video, the tool trims the end of earlier tracks (never the final cue) so the soundtrack still resolves on the last frame.
 - Global mixes: pass `--audio-file background.mp3` to append a traditional soundtrack instead of per-slide cues.
 - Use `--chunk-size 120 --batch` to render every 120-item slice automatically (outputs `slideshow-1.mp4`, `slideshow-2.mp4`, ...). For a single slice, combine `--chunk-size` with `--chunk-index`.
 - Tweak typography via `title_font_size` / `body_font_size` in `config.json`.
