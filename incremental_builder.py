@@ -671,6 +671,7 @@ def diff_snapshot(old: Dict[Path, float], new: Dict[Path, float]) -> List[Path]:
 def run_build(args: argparse.Namespace, announce_audio: bool = True) -> BuildContext:
     config = load_config(args.config)
     stv.configure_motion(config)
+    keep_temp = stv._config_bool(config, "keep_temp", False)
 
     stv.VERBOSE = False
     stv.FFMPEG_DEBUG = False
@@ -746,7 +747,7 @@ def run_build(args: argparse.Namespace, announce_audio: bool = True) -> BuildCon
         segments_dir = args.segments_dir.resolve()
     else:
         segments_dir = work_dir_root / "segments"
-    if not has_existing_output(base_output) and segments_dir.exists():
+    if not keep_temp and not has_existing_output(base_output) and segments_dir.exists():
         shutil.rmtree(segments_dir)
     ensure_dir(segments_dir)
     subtitles_root = segments_dir / "subtitles"

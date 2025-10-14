@@ -33,6 +33,8 @@ DEFAULT_CONFIG = {
     "chunk_index": 1,
     "debug_filename": False,
     "audio_files": [],
+    "work_dir": "segments",
+    "keep_temp": False,
     "transitions": {
         "enabled": False,
         "motions": list(EFFECT_SEQUENCE),
