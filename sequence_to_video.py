@@ -14,7 +14,8 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Iterable, List, Optional, Sequence, Tuple
 
-from lib import collage, subtitle_renderer, text_renderer
+import incremental_builder as ib
+from lib import text_renderer
 from lib.motion import EFFECT_SEQUENCE, MotionPlan, build_motion_filter, select_motion
 from lib.text_utils import TextLayout, combine_overlay_texts, load_text_layout
 
@@ -226,23 +227,6 @@ def ensure_mp4_suffix(path: Path) -> Path:
 
 
 @dataclass(frozen=True)
-class Segment:
-    source: Path
-    output: Path
-    kind: str  # "image", "video", or "text"
-    label: Optional[str] = None
-    text_layout: Optional[TextLayout] = None
-    overlay_text: Optional[str] = None
-    overlay_sources: tuple[Path, ...] = ()
-    duration: Optional[float] = None
-    overlay_layout: Optional[TextLayout] = None
-    panel_image: Optional[Path] = None
-    overlay_subtitle: Optional[Path] = None
-    expected_duration: Optional[float] = None
-    visual_sources: tuple[Path, ...] = ()
-
-
-@dataclass(frozen=True)
 class AudioMarker:
     path: Path
     segment_index: int
@@ -255,6 +239,13 @@ class AudioTimelineEntry:
     end: float
     fade_in: float = 0.0
     fade_out: float = 0.0
+
+
+@dataclass
+class RenderedSegment:
+    info: "ib.SegmentInfo"
+    output: Path
+    expected_duration: Optional[float]
 
 
 class FFMpegError(RuntimeError):
@@ -286,6 +277,7 @@ def parse_args(config: dict[str, object]) -> argparse.Namespace:
     default_debug_filename = _config_bool(
         config, "debug_filename", DEFAULT_CONFIG["debug_filename"]
     )
+    default_keep_temp = _config_bool(config, "keep_temp", False)
     config_audio_list = _config_list(config, "audio_files")
     audio_default_desc = (
         ", ".join(config_audio_list) if config_audio_list else "none"
@@ -353,8 +345,16 @@ def parse_args(config: dict[str, object]) -> argparse.Namespace:
     )
     parser.add_argument(
         "--keep-temp",
+        dest="keep_temp",
         action="store_true",
+        default=default_keep_temp,
         help="Keep intermediate segment files for debugging.",
+    )
+    parser.add_argument(
+        "--no-keep-temp",
+        dest="keep_temp",
+        action="store_false",
+        help="Delete intermediate segment files after finishing (overrides config).",
     )
     parser.add_argument(
         "--limit",
@@ -445,6 +445,8 @@ def main() -> None:
     config = load_config(CONFIG_PATH)
     configure_motion(config)
     args = parse_args(config)
+    work_dir_root = Path(config.get("work_dir", "segments")).resolve()
+    work_dir_root.mkdir(parents=True, exist_ok=True)
     if args.debug_ffmpeg:
         args.verbose = True
     global VERBOSE, FFMPEG_DEBUG
@@ -545,6 +547,7 @@ def main() -> None:
                 height,
                 output_path,
                 source_dir,
+                work_dir_root,
                 audio_paths=resolved_audio_paths,
             )
         return
@@ -598,6 +601,7 @@ def main() -> None:
         height,
         args.output,
         source_dir,
+        work_dir_root,
         audio_paths=resolved_audio_paths,
     )
 
@@ -611,18 +615,17 @@ def render_slideshow(
     height: int,
     output_path: Path,
     source_dir: Path,
+    work_dir_root: Path,
     audio_paths: Optional[Sequence[Path]] = None,
 ) -> None:
-    media_files = list(media_files)
-    if args.limit and not args.batch:
-        media_files = media_files[: args.limit]
+    selected_media = list(media_files)
 
     resolved_audio_paths = list(audio_paths or [])
 
     prefix_order: List[str] = []
     seen_prefixes: set[str] = set()
     pending_audio: List[tuple[str, Path]] = []
-    for path in media_files:
+    for path in selected_media:
         suffix = path.suffix.lower()
         prefix = path.stem.split("_", 1)[0]
         if suffix in AUDIO_EXTENSIONS:
@@ -632,372 +635,195 @@ def render_slideshow(
             prefix_order.append(prefix)
             seen_prefixes.add(prefix)
 
-    segments: List[Segment] = []
-    audio_markers: list[AudioMarker] = []
-    tmp_dir_ctx = tempfile.TemporaryDirectory() if not args.keep_temp else None
-    if tmp_dir_ctx is not None:
-        temp_dir_path = Path(tmp_dir_ctx.name)
-    else:
-        temp_dir_path = output_path.parent / ".segments"
-        temp_dir_path.mkdir(parents=True, exist_ok=True)
-
-    text_panel_temp_dir = temp_dir_path / "text_panels"
-    subtitle_temp_dir = temp_dir_path / "subtitles"
-    collage_root = temp_dir_path / "collages"
-    collage_root.mkdir(parents=True, exist_ok=True)
-
-    segment_index = 0
-    segment_index_by_prefix: dict[str, int] = {}
-
-    for prefix in prefix_order:
-        visuals, overlays = collage.collect_assets(source_dir, prefix)
-        image_files = [path for path in visuals if path.suffix.lower() in IMAGE_EXTENSIONS]
-        video_files = [path for path in visuals if path.suffix.lower() in VIDEO_EXTENSIONS]
-
-        overlay_layout: Optional[TextLayout] = None
-        overlay_text_value: Optional[str] = None
-        overlay_subtitle_path: Optional[Path] = None
-        if overlays:
-            combined_layout = combine_overlay_texts(overlays)
-            if combined_layout.lines or combined_layout.title or combined_layout.metadata:
-                overlay_layout = combined_layout
-                overlay_text_value = combined_layout.overlay_text()
-                if not overlay_text_value:
-                    overlay_text_value = None
-
-        duration_override: Optional[float] = None
-        if overlay_layout:
-            duration_str = overlay_layout.metadata.get("duration")
-            if duration_str:
-                try:
-                    duration_override = float(duration_str)
-                except ValueError:
-                    duration_override = None
-
-        if image_files:
-            primary_source = image_files[0]
-            segment_index += 1
-            segment_path = temp_dir_path / f"segment_{segment_index:04d}.mp4"
-            duration_value = (
-                duration_override
-                if duration_override is not None
-                else (args.duration_overlay if overlay_text_value else args.duration_image)
-            )
-            if overlay_layout and overlay_text_value:
-                overlay_subtitle_path = subtitle_renderer.create_ass_subtitle(
-                    overlay_layout,
-                    width,
-                    height,
-                    FONT_PATH,
-                    subtitle_temp_dir,
-                    duration_value,
-                )
-            segments.append(
-                Segment(
-                    source=primary_source,
-                    output=segment_path,
-                    kind="image",
-                    label=infer_year_text(primary_source),
-                    overlay_text=overlay_text_value,
-                    overlay_sources=tuple(overlays),
-                    duration=duration_value,
-                    overlay_layout=overlay_layout,
-                    overlay_subtitle=overlay_subtitle_path,
-                    expected_duration=duration_value,
-                    visual_sources=tuple(image_files),
-                )
-            )
-            segment_index_by_prefix[prefix] = len(segments) - 1
-            continue
-
-        if video_files:
-            primary_video = video_files[0]
-            segment_index += 1
-            segment_path = temp_dir_path / f"segment_{segment_index:04d}.mp4"
-            if overlay_layout and overlay_text_value:
-                overlay_subtitle_path = subtitle_renderer.create_ass_subtitle(
-                    overlay_layout,
-                    width,
-                    height,
-                    FONT_PATH,
-                    subtitle_temp_dir,
-                    None,
-                )
-            expected_duration = probe_media_duration(ffprobe_path, primary_video)
-            segments.append(
-                Segment(
-                    source=primary_video,
-                    output=segment_path,
-                    kind="video",
-                    label=infer_year_text(primary_video),
-                    overlay_text=overlay_text_value,
-                    overlay_sources=tuple(overlays),
-                    duration=None,
-                    overlay_layout=overlay_layout,
-                    overlay_subtitle=overlay_subtitle_path,
-                    expected_duration=expected_duration,
-                    visual_sources=tuple(video_files),
-                )
-            )
-            segment_index_by_prefix[prefix] = len(segments) - 1
-            continue
-
-        if overlays:
-            segment_index += 1
-            segment_path = temp_dir_path / f"segment_{segment_index:04d}.mp4"
-            text_layout = overlay_layout if overlay_layout else combine_overlay_texts(overlays)
-            if duration_override is None:
-                duration_str = text_layout.metadata.get("duration")
-                if duration_str:
-                    try:
-                        duration_override = float(duration_str)
-                    except ValueError:
-                        duration_override = None
-            panel_image = text_renderer.render_text_panel(
-                text_layout,
-                width,
-                height,
-                FONT_PATH,
-                background=True,
-                output_dir=text_panel_temp_dir,
-            )
-            text_duration = duration_override if duration_override is not None else args.duration_text
-            segments.append(
-                Segment(
-                    source=overlays[0],
-                    output=segment_path,
-                    kind="text",
-                    text_layout=text_layout,
-                    duration=text_duration,
-                    panel_image=panel_image,
-                    expected_duration=text_duration,
-                )
-            )
-            segment_index_by_prefix[prefix] = len(segments) - 1
-            continue
-
-    for audio_prefix, audio_path in pending_audio:
-        target_index = segment_index_by_prefix.get(audio_prefix, len(segments))
-        audio_markers.append(AudioMarker(path=audio_path, segment_index=target_index))
-
-    if not segments:
+    plan_inputs = [source_dir / prefix for prefix in prefix_order]
+    if not plan_inputs:
         print("No convertible media files found.")
-        if tmp_dir_ctx:
-            tmp_dir_ctx.cleanup()
         return
 
-    concat_entries: List[str] = []
-    for segment in segments:
-        concat_entries.append(f"file '{segment.output.as_posix()}'")
+    plan = ib.build_segment_plan(
+        plan_inputs,
+        limit=None,
+        duration_image=args.duration_image,
+        duration_overlay=args.duration_overlay,
+        duration_text=args.duration_text,
+    )
+    if not plan:
+        print("No convertible media files found.")
+        return
 
-    concat_path = temp_dir_path / "concat.txt"
+    work_dir_root.mkdir(parents=True, exist_ok=True)
+    segments_dir = work_dir_root
+    subtitles_root = work_dir_root / "subtitles"
+    segments_dir.mkdir(parents=True, exist_ok=True)
+    subtitles_root.mkdir(parents=True, exist_ok=True)
+
+    existing_subtitle_files = {
+        path for path in subtitles_root.glob("**/*") if path.is_file()
+    }
+    existing_subtitle_dirs = {
+        path for path in subtitles_root.glob("**") if path.is_dir()
+    }
+
+    rendered_segments: list[RenderedSegment] = []
+    segment_index_by_prefix: dict[str, int] = {}
+    new_segment_paths: list[Path] = []
+
+    total = len(plan)
+    for idx, segment in enumerate(plan, start=1):
+        output_segment_path = ib.segment_output_path(segments_dir, segment)
+        output_segment_path.parent.mkdir(parents=True, exist_ok=True)
+        if output_segment_path.exists():
+            output_segment_path.unlink()
+
+        extras: List[str] = []
+        if LABEL_YEAR:
+            label = infer_year_text(segment.source)
+            if label:
+                extras.append(f"label {label}")
+        if segment.kind == "image" and len(segment.visual_sources) > 1:
+            extras.append("collage")
+        if segment.overlay_text:
+            overlay_names = (
+                ", ".join(src.name for src in segment.overlay_sources)
+                if segment.overlay_sources
+                else "overlay text"
+            )
+            extras.append(f"overlay {overlay_names}")
+        if SHOW_FILENAME:
+            extras.append(f"filename {segment.source.name}")
+        if segment.kind == "text" and segment.overlay_layout:
+            preview = segment.overlay_layout.preview_text()
+            if preview:
+                ellipsis = "…" if len(preview) > 40 else ""
+                extras.append(f"text '{preview[:40]}{ellipsis}'")
+            else:
+                extras.append("text slide")
+
+        extra_note = f" ({', '.join(extras)})" if extras else ""
+        print(f"[{idx}/{total}] {segment.kind} {segment.source.name} -> {output_segment_path.name}{extra_note}")
+
+        ib.render_segment(
+            segment,
+            output_segment_path,
+            subtitles_root,
+            width,
+            height,
+            args.fps,
+            ffmpeg_path,
+            ffprobe_path,
+            args.duration_image,
+        )
+
+        if segment.kind == "video":
+            expected_duration: Optional[float] = None
+        elif segment.kind == "text":
+            expected_duration = segment.duration if segment.duration is not None else args.duration_text
+        else:
+            expected_duration = segment.duration if segment.duration is not None else args.duration_image
+
+        rendered_segments.append(
+            RenderedSegment(info=segment, output=output_segment_path, expected_duration=expected_duration)
+        )
+        new_segment_paths.append(output_segment_path)
+
+        prefix_source = segment.visual_sources[0] if segment.visual_sources else segment.source
+        segment_prefix = prefix_source.stem.split("_", 1)[0]
+        if segment_prefix not in segment_index_by_prefix:
+            segment_index_by_prefix[segment_prefix] = len(rendered_segments) - 1
+
+    audio_markers: list[AudioMarker] = []
+    for audio_prefix, audio_path in pending_audio:
+        target_index = segment_index_by_prefix.get(audio_prefix, len(rendered_segments))
+        audio_markers.append(AudioMarker(path=audio_path, segment_index=target_index))
+
+    concat_entries = [f"file '{segment.output.as_posix()}'" for segment in rendered_segments]
+    concat_path = segments_dir / "concat.txt"
     concat_path.write_text("\n".join(concat_entries), encoding="utf-8")
 
-    try:
-        total = len(segments)
-        for idx, segment in enumerate(segments, start=1):
-            label = segment.label if LABEL_YEAR else None
-            extra: List[str] = []
-            if label:
-                extra.append(f"label {label}")
-            if segment.kind == "image" and len(segment.visual_sources) > 1:
-                extra.append("collage")
-            if segment.overlay_text:
-                overlay_names = (
-                    ", ".join(src.name for src in segment.overlay_sources)
-                    if segment.overlay_sources
-                    else "overlay text"
-                )
-                extra.append(f"overlay {overlay_names}")
-            if SHOW_FILENAME:
-                extra.append(f"filename {segment.source.name}")
-            if segment.kind == "text" and segment.text_layout:
-                preview = segment.text_layout.preview_text()
-                if preview:
-                    ellipsis = "…" if len(preview) > 40 else ""
-                    extra.append(f"text '{preview[:40]}{ellipsis}'")
-                else:
-                    extra.append("text slide")
+    run_ffmpeg(
+        [
+            ffmpeg_path,
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-y",
+            "-f",
+            "concat",
+            "-safe",
+            "0",
+            "-i",
+            str(concat_path),
+            "-c",
+            "copy",
+            str(output_path),
+        ]
+    )
+    print(f"Created {output_path}")
+
+    video_duration = probe_media_duration(ffprobe_path, output_path)
+
+    if audio_markers:
+        if ffprobe_path is None:
             print(
-                f"[{idx}/{total}] {segment.kind} {segment.source.name}"
-                f" -> {segment.output.name}" + (f" ({', '.join(extra)})" if extra else "")
+                "Warning: audio cues detected but ffprobe is unavailable; skipping timeline audio."
             )
-            debug_text = segment.source.name if SHOW_FILENAME else None
-            if segment.kind == "image":
-                visuals = list(segment.visual_sources) if segment.visual_sources else []
-                source_input: Path
-                if visuals:
-                    source_input = visuals[0]
-                else:
-                    source_input = segment.source
-                if len(visuals) > 1:
-                    workspace = collage_root / f"collage_{idx:04d}"
-                    workspace.mkdir(parents=True, exist_ok=True)
-                    source_input = collage.build_collage(
-                        ffmpeg_path,
-                        ffprobe_path,
-                        visuals,
-                        width,
-                        height,
-                        workspace,
-                    )
-
-                still_duration = segment.duration or args.duration_image
-                motion_plan = get_motion_plan(idx, still_duration, args.fps)
-                filter_graph, filter_output = build_media_filter_graph(
-                    width,
-                    height,
-                    segment.overlay_text,
-                    label,
-                    debug_text,
-                    segment.overlay_subtitle,
-                    motion_plan,
-                )
-                run_ffmpeg(
-                    [
-                        ffmpeg_path,
-                        "-hide_banner",
-                        "-loglevel",
-                        "error",
-                        "-y",
-                        "-loop",
-                        "1",
-                        "-framerate",
-                        str(args.fps),
-                        "-t",
-                        f"{still_duration}",
-                        "-i",
-                        str(source_input),
-                        "-f",
-                        "lavfi",
-                        "-t",
-                        f"{still_duration}",
-                        "-i",
-                        "anullsrc=channel_layout=stereo:sample_rate=48000",
-                        "-shortest",
-                        "-filter_complex",
-                        filter_graph,
-                        "-map",
-                        f"[{filter_output}]",
-                        "-map",
-                        "1:a:0",
-                        "-c:v",
-                        "libx264",
-                        "-pix_fmt",
-                        "yuv420p",
-                        "-r",
-                        str(args.fps),
-                        "-c:a",
-                        "aac",
-                        "-b:a",
-                        "192k",
-                        "-movflags",
-                        "+faststart",
-                        str(segment.output),
-                    ]
-                )
-            elif segment.kind == "video":
-                filter_graph, filter_output = build_media_filter_graph(
-                    width,
-                    height,
-                    segment.overlay_text,
-                    label,
-                    debug_text,
-                    segment.overlay_subtitle,
-                    None,
-                )
-                run_ffmpeg(
-                    [
-                        ffmpeg_path,
-                        "-hide_banner",
-                        "-loglevel",
-                        "error",
-                        "-y",
-                        "-i",
-                        str(segment.source),
-                        "-filter_complex",
-                        filter_graph,
-                        "-map",
-                        f"[{filter_output}]",
-                        "-map",
-                        "0:a?",
-                        "-r",
-                        str(args.fps),
-                        "-c:v",
-                        "libx264",
-                        "-pix_fmt",
-                        "yuv420p",
-                        "-c:a",
-                        "aac",
-                        "-b:a",
-                        "192k",
-                        "-movflags",
-                        "+faststart",
-                        str(segment.output),
-                    ]
-                )
-            else:  # text
-                slide_duration = segment.duration or args.duration_text
-                if segment.text_layout is None:
-                    raise RuntimeError(f"Missing text layout for segment {segment.source}")
-                run_ffmpeg(
-                    build_text_segment_cmd(
-                        ffmpeg_path,
-                        segment.text_layout,
-                        segment.output,
-                        slide_duration,
-                        width,
-                        height,
-                        args.fps,
-                        debug_text,
-                    )
-                )
-
-        if audio_markers:
-            if ffprobe_path is None:
-                print(
-                    "Warning: audio cues detected but ffprobe is unavailable; skipping timeline audio."
-                )
-                audio_entries = []
-            else:
-                segment_durations = ensure_segment_durations(ffprobe_path, segments)
-                audio_entries = build_audio_timeline(audio_markers, segment_durations)
+            audio_entries: Sequence[AudioTimelineEntry] = []
         else:
-            audio_entries = []
+            segment_durations = ensure_segment_durations(ffprobe_path, rendered_segments)
+            audio_entries = build_audio_timeline(audio_markers, segment_durations)
+    else:
+        audio_entries = []
 
-        run_ffmpeg(
-            [
-                ffmpeg_path,
-                "-hide_banner",
-                "-loglevel",
-                "error",
-                "-y",
-                "-f",
-                "concat",
-                "-safe",
-                "0",
-                "-i",
-                str(concat_path),
-                "-c",
-                "copy",
-                str(output_path),
-            ]
+    if audio_entries:
+        audio_output_path = output_path.with_name(f"{output_path.stem}_audio.mp3")
+        create_timeline_audio(ffmpeg_path, audio_entries, audio_output_path, video_duration)
+        final_output_path = output_path.with_name(
+            f"{output_path.stem}_with_audio{output_path.suffix}"
         )
-        print(f"Created {output_path}")
-        video_duration = probe_media_duration(ffprobe_path, output_path)
-        if audio_entries:
-            audio_output_path = output_path.with_name(f"{output_path.stem}_audio.mp3")
-            create_timeline_audio(ffmpeg_path, audio_entries, audio_output_path, video_duration)
-            final_output_path = output_path.with_name(
-                f"{output_path.stem}_with_audio{output_path.suffix}"
-            )
-            mux_video_with_audio(ffmpeg_path, output_path, audio_output_path, final_output_path)
-            print(f"Created {final_output_path}")
-        elif resolved_audio_paths:
-            apply_audio_track(ffmpeg_path, output_path, resolved_audio_paths, ffprobe_path, video_duration)
-    finally:
-        if tmp_dir_ctx:
-            tmp_dir_ctx.cleanup()
+        mux_video_with_audio(ffmpeg_path, output_path, audio_output_path, final_output_path)
+        print(f"Created {final_output_path}")
+    elif resolved_audio_paths:
+        apply_audio_track(
+            ffmpeg_path,
+            output_path,
+            resolved_audio_paths,
+            ffprobe_path,
+            video_duration,
+        )
+
+    if not args.keep_temp:
+        for path in new_segment_paths:
+            try:
+                path.unlink(missing_ok=True)
+            except OSError:
+                pass
+        current_subtitle_files = {
+            path for path in subtitles_root.glob("**/*") if path.is_file()
+        }
+        new_subtitle_files = current_subtitle_files - existing_subtitle_files
+        for path in new_subtitle_files:
+            try:
+                path.unlink(missing_ok=True)
+            except OSError:
+                pass
+        current_subtitle_dirs = {
+            path for path in subtitles_root.glob("**") if path.is_dir()
+        }
+        new_dirs = current_subtitle_dirs - existing_subtitle_dirs
+        for directory in sorted(new_dirs, key=lambda p: len(p.parts), reverse=True):
+            try:
+                directory.rmdir()
+            except OSError:
+                pass
+        try:
+            concat_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+        try:
+            if not any(subtitles_root.glob("**/*")):
+                subtitles_root.rmdir()
+        except OSError:
+            pass
 
 
 def parse_resolution(value: str) -> Tuple[int, int]:
@@ -1476,7 +1302,7 @@ def probe_media_duration(ffprobe_path: Optional[str], media_path: Path) -> Optio
 
 
 def ensure_segment_durations(
-    ffprobe_path: Optional[str], segments: Sequence[Segment]
+    ffprobe_path: Optional[str], segments: Sequence[RenderedSegment]
 ) -> list[float]:
     durations: list[float] = []
     for segment in segments:

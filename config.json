@@ -31,5 +31,7 @@
       "pan_diag_down_right"
     ],
     "duration": 1.0
-  }
+  },
+  "work_dir": "segments",
+  "keep_temp": true
 }

@@ -721,6 +721,8 @@ def run_build(args: argparse.Namespace, announce_audio: bool = True) -> BuildCon
         config.get("duration_overlay", stv.DEFAULT_CONFIG["duration_overlay"])
     )
     duration_text = float(config.get("duration_text", stv.DEFAULT_CONFIG["duration_text"]))
+    work_dir_root = Path(config.get("work_dir", "segments")).resolve()
+    ensure_dir(work_dir_root)
 
     watch_paths: Set[Path] = {args.config.resolve(), source_dir}
 
@@ -740,7 +742,10 @@ def run_build(args: argparse.Namespace, announce_audio: bool = True) -> BuildCon
         print("No convertible media files found.")
         return BuildContext(watch_paths, input_paths)
 
-    segments_dir = args.segments_dir.resolve()
+    if args.segments_dir:
+        segments_dir = args.segments_dir.resolve()
+    else:
+        segments_dir = work_dir_root / "segments"
     if not has_existing_output(base_output) and segments_dir.exists():
         shutil.rmtree(segments_dir)
     ensure_dir(segments_dir)
